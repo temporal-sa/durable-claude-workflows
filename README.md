@@ -94,13 +94,6 @@ sequenceDiagram
 
     Note over W: every Claude result is recorded in Event History, so<br/>a worker crash resumes mid-run without redoing finished work
 ```
-
-```
- chat client ──enter──▶ Temporal workflow (the agent loop, one per chat)
-                          │  plan ─▶ fan out subagents ─▶ review ─▶ (refine?) ─▶ synthesize
- workers ──poll work──────┘     more workers ⇒ more subagents at once, on more machines
-```
-
 ---
 
 ## Setup
