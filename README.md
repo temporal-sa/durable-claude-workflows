@@ -203,4 +203,4 @@ client.py      the Temporal-branded chat client
 
 Flat Python modules (no package), managed and run with `uv`.
 
-*Claude plans, creates workflows and executes while Temporal provides durable runtime, surviving any crashes or restarts.*
+*Claude plans, Temporal executes.*
