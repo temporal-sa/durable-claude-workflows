@@ -152,6 +152,7 @@ claude --resume 11111111-1111-4111-8111-111111111111       # try to continue
 > the server, so killing a worker loses nothing already finished.
 
 **Temporal + Claude - survives a worker crash.** In three terminals:
+
 ```bash
 # 1) Temporal server - skip if using Temporal Cloud (UI: http://localhost:8233)
 temporal server start-dev
@@ -160,11 +161,15 @@ temporal server start-dev
 ```
 
 ![Temporal - Before Crash](images/temporal-1.png)
+
 While the subagents run, **kill the worker** (`Ctrl-C`, or `kill -9` for a hard crash), then **restart it** (re-run #2).
 
 ![Temporal - During Crash](images/temporal-3.png)
+
 **Expected:** with the worker dead the Web UI still shows the workflow **Running** and finished subagents **Completed**; on restart it continues, re-runs only the in-flight step, and the original request completes, without re-running completed steps and is able to print final report. ✅
+
 ![Temporal - After Crash](images/temporal-4.png)
+
 ---
 
 ## Configuration (`.env`)
