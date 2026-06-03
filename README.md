@@ -136,11 +136,13 @@ server (durable) or the Claude process (ephemeral). Kill the process mid-run and
 ```bash
 claude --session-id 11111111-1111-4111-8111-111111111111
 #   then:  ultracode: research <topic> with subagents that cross-check each other   (watch with /workflows)
+```
 ![Claude Code - Before Crash](images/claude-1.png)
+```bash
 kill -9 $(pgrep -f 11111111-1111-4111-8111-111111111111)   # hard-crash mid-run, from another terminal
 claude --resume 11111111-1111-4111-8111-111111111111       # try to continue
-![Claude Code - After Crash](images/claude-2.png)
 ```
+![Claude Code - After Crash](images/claude-2.png)
 
 **Expected:** the run does **not** continue - it starts fresh, finished subagents gone. ❌ Per the
 [docs](https://code.claude.com/docs/en/workflows): *"the next session starts the workflow fresh."*
