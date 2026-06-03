@@ -138,27 +138,15 @@ Useful flags: `--max-iterations`, `--max-subagents`, `--session-id`, `--address`
 Same plan-and-fan-out, run two ways. The difference is **where the run's state lives** - Temporal's
 server (durable) or the Claude process (ephemeral). Kill the process mid-run and see who survives.
 
-**This sample (Temporal + Claude) - survives a worker crash.** In three terminals:
-
-```bash
-# 1) Temporal server - skip if already running (UI: http://localhost:8233)
-temporal server start-dev
-# 2) a worker - slow mock stages give you time to crash it mid-run
-DURABLE_CLAUDE_MOCK=1 DURABLE_CLAUDE_MOCK_LATENCY=20 uv run python worker.py
-# 3) start a research run
-DURABLE_CLAUDE_MOCK=1 uv run python client.py --once "Compare Temporal and Claude Code dynamic workflows"
-```
-
-While the subagents run, **kill the worker** (`Ctrl-C`, or `kill -9` for a hard crash), then **restart it** (re-run #2).
-**Expected:** with the worker dead the Web UI still shows the workflow **Running** and finished subagents **Completed**; on restart it continues, re-runs only the in-flight step, and the client prints its report. ✅
-
-**Claude Code dynamic workflow - lost on a crash.** Needs Claude Code v2.1.154+ with workflows enabled:
+**Claude Code dynamic workflow - lost on a crash.**
 
 ```bash
 claude --session-id 11111111-1111-4111-8111-111111111111
 #   then:  ultracode: research <topic> with subagents that cross-check each other   (watch with /workflows)
+![Claude Code - Before Crash](images/claude-1.png)
 kill -9 $(pgrep -f 11111111-1111-4111-8111-111111111111)   # hard-crash mid-run, from another terminal
 claude --resume 11111111-1111-4111-8111-111111111111       # try to continue
+![Claude Code - After Crash](images/claude-2.png)
 ```
 
 **Expected:** the run does **not** continue - it starts fresh, finished subagents gone. ❌ Per the
@@ -168,6 +156,20 @@ claude --resume 11111111-1111-4111-8111-111111111111       # try to continue
 > the **process** loses the run, because that's the only place the state lived. On Temporal the state is on
 > the server, so killing a worker loses nothing already finished.
 
+**Temporal + Claude - survives a worker crash.** In three terminals:
+```bash
+# 1) Temporal server - skip if using Temporal Cloud (UI: http://localhost:8233)
+temporal server start-dev
+# 2) a worker - uv run python worker.py
+# 3) start a research run using client - uv run client.py
+```
+
+![Temporal - Before Crash](images/temporal-1.png)
+While the subagents run, **kill the worker** (`Ctrl-C`, or `kill -9` for a hard crash), then **restart it** (re-run #2).
+
+![Temporal - During Crash](images/temporal-3.png)
+**Expected:** with the worker dead the Web UI still shows the workflow **Running** and finished subagents **Completed**; on restart it continues, re-runs only the in-flight step, and the original request completes, without re-running completed steps and is able to print final report. ✅
+![Temporal - After Crash](images/temporal-4.png)
 ---
 
 ## Configuration (`.env`)
@@ -201,4 +203,4 @@ client.py      the Temporal-branded chat client
 
 Flat Python modules (no package), managed and run with `uv`.
 
-*Claude plans, Temporal executes.*
+*Claude plans, creates workflows and executes while Temporal provides durable runtime, surviving any crashes or restarts.*
