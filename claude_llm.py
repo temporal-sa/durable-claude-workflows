@@ -1,14 +1,14 @@
-"""Anthropic API helpers — the ONLY place that calls Claude.
+"""Anthropic API helpers - the ONLY place that calls Claude.
 
 Every function here runs inside a Temporal activity, so:
-  * the SDK's own retries are disabled (``max_retries=0``) — Temporal owns retries;
-  * exceptions are mapped to ``ApplicationError`` with sensible retryable/
-    non-retryable classification;
+  * the SDK's own retries are disabled (``max_retries=0``) - Temporal owns retries;
+  * exceptions are mapped to ``ApplicationError`` with retryable / non-retryable
+    classification;
   * calls heartbeat on a fixed cadence via a background ticker, so the worker can
     detect stalls and deliver cancellation even while a call is blocked.
 
-This is where "Claude plans" happens (``plan``) and where each subagent's
-research, the adversarial review, and the final synthesis run.
+``plan`` is where "Claude authors the dynamic workflow" happens: it returns a DAG
+of typed nodes. ``run_node`` executes one node (agent / review / synthesize).
 """
 
 from __future__ import annotations
@@ -26,12 +26,10 @@ from temporalio.exceptions import ApplicationError
 import config
 from models import (
     PLAN_SCHEMA,
-    REVIEW_SCHEMA,
-    Plan,
-    ReviewResult,
-    SubAgentResult,
-    SubAgentTask,
+    NodeResult,
+    PlanNode,
     Turn,
+    WorkflowPlan,
 )
 
 # --------------------------------------------------------------------------
@@ -43,8 +41,6 @@ _client_obj: AsyncAnthropic | None = None
 def _client() -> AsyncAnthropic:
     global _client_obj
     if _client_obj is None:
-        # Disable SDK retries — Temporal's RetryPolicy handles them durably.
-        # Credentials resolve from ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN / ant profile.
         _client_obj = AsyncAnthropic(max_retries=0, timeout=600.0)
     return _client_obj
 
@@ -53,28 +49,23 @@ def _map_error(e: Exception) -> ApplicationError:
     if isinstance(e, ApplicationError):
         return e
     if isinstance(e, anthropic.AuthenticationError):
-        return ApplicationError(
-            f"Anthropic authentication failed (set ANTHROPIC_API_KEY): {e}",
-            type="AuthError",
-            non_retryable=True,
-        )
+        return ApplicationError(f"Anthropic authentication failed (set ANTHROPIC_API_KEY): {e}",
+                                type="AuthError", non_retryable=True)
     if isinstance(e, anthropic.PermissionDeniedError):
         return ApplicationError(f"Permission denied: {e}", type="PermissionError", non_retryable=True)
     if isinstance(e, anthropic.NotFoundError):
-        return ApplicationError(
-            f"Not found — check the model id: {e}", type="NotFound", non_retryable=True
-        )
+        return ApplicationError(f"Not found - check the model id: {e}", type="NotFound", non_retryable=True)
     if isinstance(e, anthropic.BadRequestError):
         return ApplicationError(f"Bad request: {e}", type="BadRequest", non_retryable=True)
     if isinstance(e, anthropic.RateLimitError):
-        return ApplicationError(f"Rate limited: {e}", type="RateLimit")  # retryable
+        return ApplicationError(f"Rate limited: {e}", type="RateLimit")
     if isinstance(e, anthropic.APIStatusError):
         status = getattr(e, "status_code", None)
-        if status and status >= 500:  # includes 529 overloaded
+        if status and status >= 500:
             return ApplicationError(f"Anthropic server error {status}: {e}", type="ServerError")
         return ApplicationError(f"Anthropic API error {status}: {e}", type="APIError", non_retryable=True)
     if isinstance(e, anthropic.APIConnectionError):
-        return ApplicationError(f"Connection error: {e}", type="ConnectionError")  # retryable
+        return ApplicationError(f"Connection error: {e}", type="ConnectionError")
     return ApplicationError(f"Unexpected error calling Claude: {e}", type="Unknown")
 
 
@@ -82,7 +73,6 @@ def _map_error(e: Exception) -> ApplicationError:
 # Low-level call helpers
 # --------------------------------------------------------------------------
 def _system(text: str) -> list[dict]:
-    # Stable system prompt → cache it (cheap reuse across the many subagent calls).
     return [{"type": "text", "text": text, "cache_control": {"type": "ephemeral"}}]
 
 
@@ -96,15 +86,13 @@ def _loads(text: str) -> dict:
         return json.loads(text)
     except Exception:
         pass
-    m = re.search(r"\{.*\}", text, re.S)  # tolerate fences / stray prose
+    m = re.search(r"\{.*\}", text, re.S)
     if m:
         try:
             return json.loads(m.group(0))
         except Exception:
             pass
-    raise ApplicationError(
-        "Claude did not return valid JSON for a structured step", type="ParseError"
-    )
+    raise ApplicationError("Claude did not return valid JSON for the plan", type="ParseError")
 
 
 @contextlib.asynccontextmanager
@@ -112,9 +100,8 @@ async def heartbeater(interval: float, label: str):
     """Heartbeat the current activity every ``interval`` seconds until the block exits.
 
     Runs as a background task so the heartbeat fires even while the Claude call is
-    blocked (adaptive thinking before the first token, between web searches, etc.).
-    A task created with ``create_task`` inherits the activity's context, so
-    ``activity.heartbeat`` targets the right activity.
+    blocked. A task created with ``create_task`` inherits the activity's context,
+    so ``activity.heartbeat`` targets the right activity.
     """
     async def _beat() -> None:
         while True:
@@ -130,12 +117,10 @@ async def heartbeater(interval: float, label: str):
             await task
 
 
-async def _structured(
-    system: str, user: str, schema: dict, *, model: str, effort: str, interval: float
-) -> dict:
+async def _structured(system: str, user: str, schema: dict, *, model: str, effort: str, interval: float) -> dict:
     client = _client()
     try:
-        async with heartbeater(interval, "structured"):
+        async with heartbeater(interval, "plan"):
             resp = await client.messages.create(
                 model=model,
                 max_tokens=8000,
@@ -144,30 +129,30 @@ async def _structured(
                 thinking={"type": "adaptive"},
                 output_config={"effort": effort, "format": {"type": "json_schema", "schema": schema}},
             )
-    except Exception as e:  # noqa: BLE001 — mapped to ApplicationError
+    except Exception as e:  # noqa: BLE001
         raise _map_error(e)
     return _loads(_first_text(resp))
 
 
 async def _stream_text(
     system: str,
-    messages: list[dict],
+    user: str,
     *,
     model: str,
     effort: str,
     interval: float,
     tools: list[dict] | None = None,
-    max_tokens: int = 16000,
+    max_tokens: int = 8000,
     hb: str = "claude",
     max_pause_continuations: int = 3,
 ) -> tuple[str, object]:
     """Stream a text response while a background ticker heartbeats on a fixed cadence.
 
-    Handles server-tool ``pause_turn`` (e.g. web_search hitting its server-side
-    iteration cap) by re-sending the accumulated assistant turn and continuing.
+    Handles server-tool ``pause_turn`` (e.g. web_search hitting its iteration cap)
+    by re-sending the accumulated assistant turn and continuing.
     """
     client = _client()
-    msgs = list(messages)
+    msgs: list[dict] = [{"role": "user", "content": user}]
     text_parts: list[str] = []
     final = None
     try:
@@ -190,7 +175,6 @@ async def _stream_text(
                     final = await stream.get_final_message()
                 if getattr(final, "stop_reason", None) != "pause_turn":
                     break
-                # Resume the server-tool loop: re-send the assistant turn verbatim.
                 msgs.append({"role": "assistant", "content": final.content})
     except Exception as e:  # noqa: BLE001
         raise _map_error(e)
@@ -233,7 +217,7 @@ def _extract_search_sources(final) -> list[str]:
                     u = getattr(item, "url", None)
                     if u:
                         urls.append(u)
-    except Exception:  # noqa: BLE001 — purely best-effort
+    except Exception:  # noqa: BLE001
         pass
     return urls
 
@@ -246,179 +230,177 @@ def _history_block(history: list[Turn]) -> str:
         return ""
     lines = ["Conversation so far (most recent last):"]
     for t in history[-6:]:
-        snippet = t.content if len(t.content) <= 600 else t.content[:600] + "…"
+        snippet = t.content if len(t.content) <= 600 else t.content[:600] + "..."
         lines.append(f"[{t.role}] {snippet}")
     return "\n".join(lines) + "\n\n"
 
 
-def _findings_block(findings: list[SubAgentResult]) -> str:
-    parts = []
-    for f in findings:
-        head = f"### [{f.id}] {f.title} (confidence {f.confidence:.2f})"
-        if f.error:
-            head += " — FAILED"
-        parts.append(head + "\n" + (f.findings or f.error or "(no findings)"))
-    return "\n\n".join(parts)
+def _upstream_block(upstream: list[NodeResult]) -> str:
+    if not upstream:
+        return ""
+    parts = ["Results from the steps this one depends on:\n"]
+    for r in upstream:
+        head = f"### [{r.id}] {r.title} ({r.kind})"
+        parts.append(head + "\n" + (r.output or r.error or "(no output)"))
+    return "\n\n".join(parts) + "\n\n"
 
 
 PLAN_SYSTEM = (
-    "You are the PLANNER of a durable multi-agent research workflow running on Temporal. "
-    "Given the user's research goal (and any prior conversation), design the plan that "
-    "Temporal will execute: a set of focused, parallelizable research subagent tasks plus "
-    "guidance for an adversarial reviewer.\n\n"
-    "Guidelines:\n"
-    "- Produce {max_subagents} tasks or fewer; each must be independent so they can run in parallel.\n"
-    "- Cover distinct facets (background/definitions, evidence/data, comparisons, "
-    "risks/limitations, recent developments) rather than overlapping.\n"
-    "- Make each question specific and answerable via web research; keep titles to 3-6 words.\n"
-    "- review_focus should name the riskiest things to double-check.\n"
+    "You are the PLANNER of a durable multi-agent workflow that runs on Temporal. For ANY task "
+    "the user gives, design the workflow as a directed acyclic graph (DAG) of steps that a runtime "
+    "will execute, fanning independent steps out in parallel.\n\n"
+    "Node kinds:\n"
+    "- \"agent\": a worker that performs one focused piece of the task by reasoning (and optional "
+    "web search). Use several independent agents (empty depends_on) for parts that can run in parallel.\n"
+    "- \"review\": adversarially cross-checks / validates the outputs of the steps it depends on "
+    "(finds gaps, errors, contradictions).\n"
+    "- \"synthesize\": produces the final deliverable from the steps it depends on.\n\n"
+    "Rules:\n"
+    "- Use {max_nodes} nodes or fewer. Give each a short unique id (e.g. a1, a2, review, final), a "
+    "short title, and a clear instruction.\n"
+    "- depends_on lists the ids whose outputs this node needs; nodes with empty depends_on run first, in parallel.\n"
+    "- Include at least one \"review\" step that depends on the agent steps, and exactly one final "
+    "\"synthesize\" step (set it as `output`) that depends on the review.\n"
+    "- Set use_web_search=true on steps that need current or external information; false otherwise.\n"
+    "- It MUST be a DAG (no cycles). Tailor the steps to the actual task - this is not limited to research.\n"
     "Respond ONLY with the JSON object matching the provided schema."
 )
 
-RESEARCH_SYSTEM = (
-    "You are a RESEARCH SUBAGENT in a larger multi-agent workflow. Investigate ONLY your "
-    "assigned sub-question — do not try to answer the whole goal.\n"
-    "- Use web search to find current, credible sources; prefer primary/authoritative ones.\n"
-    "- Report concise markdown bullet findings with specific facts, figures, and dates, each "
-    "tied to a source.\n"
-    "- End with a 'Sources:' list of URLs, then a final line exactly like 'Confidence: 0.8' "
-    "reflecting how well-supported your findings are."
-)
-
-RESEARCH_SYSTEM_NOSEARCH = (
-    "You are a RESEARCH SUBAGENT in a larger multi-agent workflow. Investigate ONLY your "
-    "assigned sub-question. Web search is unavailable, so answer from your own knowledge and "
-    "clearly flag anything uncertain or potentially out of date. Report concise markdown "
-    "bullet findings, then a final line exactly like 'Confidence: 0.5'."
+AGENT_SYSTEM = (
+    "You are a worker agent inside a larger workflow. Do ONLY your assigned step - not the whole task. "
+    "Be concrete and well-grounded. If web search is available, use it for current or external facts "
+    "and cite sources. Return your result directly (markdown is fine). If you used sources, end with a "
+    "'Sources:' list of URLs and a final line exactly like 'Confidence: 0.8'."
 )
 
 REVIEW_SYSTEM = (
-    "You are an ADVERSARIAL REVIEWER. Scrutinize the subagents' findings against the research "
-    "goal. Identify contradictions, unsupported claims, missing facets, and weak sourcing, then "
-    "decide whether the evidence is sufficient to write a high-quality, verified answer.\n"
-    "- If it is sufficient, set satisfied=true with empty followup_tasks.\n"
-    "- If not, set satisfied=false and propose a FEW targeted follow-up subagent tasks that would "
-    "close the most important gaps.\n"
-    "Be strict but fair. Respond ONLY with the JSON object matching the provided schema."
+    "You are an ADVERSARIAL REVIEWER inside a workflow. Scrutinize the upstream results against the "
+    "overall goal and your instruction: surface errors, gaps, unsupported claims, and contradictions. "
+    "Return a concise, specific critique that the synthesizer should account for."
 )
 
 SYNTH_SYSTEM = (
-    "You are the SYNTHESIZER. Write the final, verified report answering the user's goal. "
-    "Integrate the subagents' findings, resolve conflicts, and explicitly account for the "
-    "reviewer's critique. Lead with a direct answer / executive summary, use clear markdown "
-    "headings, support claims with the gathered evidence, and include a 'Sources' section. "
-    "Be accurate and concise; do not invent facts beyond the findings."
+    "You are the SYNTHESIZER. Produce the final deliverable for the user's goal, following your "
+    "instruction, integrating the upstream results and explicitly addressing the reviewer's critique. "
+    "Lead with a direct answer, use clear markdown structure, and do not invent facts beyond the inputs."
 )
 
 
 # --------------------------------------------------------------------------
-# Public activity-facing functions
+# Plan: Claude authors the DAG (then we validate + normalize it)
 # --------------------------------------------------------------------------
-async def plan(goal: str, history: list[Turn], max_subagents: int, *, model: str, effort: str) -> Plan:
+def _normalize_plan(data: dict, goal: str, max_nodes: int) -> WorkflowPlan:
+    raw = (data.get("nodes") or [])[:max_nodes]
+    nodes: list[PlanNode] = []
+    seen: set[str] = set()
+    for i, n in enumerate(raw):
+        if not isinstance(n, dict):
+            continue
+        nid = str(n.get("id") or f"n{i + 1}").strip() or f"n{i + 1}"
+        while nid in seen:  # de-duplicate ids
+            nid = f"{nid}_"
+        seen.add(nid)
+        kind = n.get("kind")
+        if kind not in ("agent", "review", "synthesize"):
+            kind = "agent"
+        nodes.append(PlanNode(
+            id=nid,
+            kind=kind,
+            title=str(n.get("title") or nid)[:80],
+            instruction=str(n.get("instruction") or goal),
+            depends_on=[str(d) for d in (n.get("depends_on") or [])],
+            use_web_search=bool(n.get("use_web_search", False)),
+        ))
+
+    if not nodes:  # never hand Temporal an empty graph
+        nodes = [PlanNode(id="a1", kind="agent", title="Work the task", instruction=goal, use_web_search=True),
+                 PlanNode(id="final", kind="synthesize", title="Synthesize answer",
+                          instruction=f"Answer: {goal}", depends_on=["a1"])]
+
+    ids = {n.id for n in nodes}
+    for n in nodes:
+        n.depends_on = [d for d in n.depends_on if d in ids and d != n.id]  # drop dangling/self deps
+    _break_cycles(nodes)
+
+    output = str(data.get("output") or "")
+    if output not in ids:
+        synth = [n.id for n in nodes if n.kind == "synthesize"]
+        output = synth[-1] if synth else nodes[-1].id
+
+    return WorkflowPlan(
+        title=str(data.get("title") or "Workflow")[:120],
+        summary=str(data.get("summary") or "")[:600],
+        nodes=nodes,
+        output=output,
+    )
+
+
+def _break_cycles(nodes: list[PlanNode]) -> None:
+    """Drop edges that would create a cycle (keep it a DAG), via a simple DFS."""
+    by_id = {n.id: n for n in nodes}
+    color: dict[str, int] = {}  # 0=unvisited, 1=in-stack, 2=done
+
+    def visit(nid: str) -> None:
+        color[nid] = 1
+        node = by_id[nid]
+        for d in list(node.depends_on):
+            c = color.get(d, 0)
+            if c == 1:  # back-edge -> cycle; drop it
+                node.depends_on.remove(d)
+            elif c == 0:
+                visit(d)
+        color[nid] = 2
+
+    for n in nodes:
+        if color.get(n.id, 0) == 0:
+            visit(n.id)
+
+
+async def plan(goal: str, history: list[Turn], max_nodes: int, *, model: str, effort: str) -> WorkflowPlan:
     data = await _structured(
-        PLAN_SYSTEM.format(max_subagents=max_subagents),
-        _history_block(history) + f"Research goal:\n{goal}\n\nDesign the research plan.",
+        PLAN_SYSTEM.format(max_nodes=max_nodes),
+        _history_block(history) + f"Task:\n{goal}\n\nDesign the workflow DAG.",
         PLAN_SCHEMA,
         model=model,
         effort=effort,
         interval=config.PLAN_HEARTBEAT_INTERVAL,
     )
-    tasks = [
-        SubAgentTask(id=i + 1, title=t["title"], question=t["question"], search_hint=t.get("search_hint", ""))
-        for i, t in enumerate((data.get("tasks") or [])[:max_subagents])
-    ]
-    if not tasks:  # never hand Temporal an empty fan-out
-        tasks = [SubAgentTask(id=1, title="Investigate goal", question=goal, search_hint="")]
-    return Plan(
-        strategy=data.get("strategy", ""),
-        review_focus=data.get("review_focus", ""),
-        tasks=tasks,
-    )
+    return _normalize_plan(data, goal, max_nodes)
 
 
-async def research(goal: str, task: SubAgentTask, *, model: str, effort: str, web_search: bool) -> SubAgentResult:
+# --------------------------------------------------------------------------
+# Run one node
+# --------------------------------------------------------------------------
+_NODE_SYSTEM = {"agent": AGENT_SYSTEM, "review": REVIEW_SYSTEM, "synthesize": SYNTH_SYSTEM}
+_NODE_INTERVAL = {
+    "agent": config.AGENT_HEARTBEAT_INTERVAL,
+    "review": config.REVIEW_HEARTBEAT_INTERVAL,
+    "synthesize": config.SYNTH_HEARTBEAT_INTERVAL,
+}
+
+
+async def run_node(goal: str, node: PlanNode, upstream: list[NodeResult], *, model: str, effort: str,
+                   web_search_enabled: bool) -> NodeResult:
+    system = _NODE_SYSTEM[node.kind]
     user = (
-        f"Overall research goal: {goal}\n\n"
-        f"Your assigned sub-question:\n"
-        f"- Title: {task.title}\n- Question: {task.question}\n- Search hint: {task.search_hint}\n\n"
-        "Investigate and report well-sourced findings."
+        f"Overall goal: {goal}\n\n"
+        f"{_upstream_block(upstream)}"
+        f"Your step ({node.kind}): {node.title}\n{node.instruction}"
     )
-    tools = (
-        [{"type": "web_search_20260209", "name": "web_search", "max_uses": 5}] if web_search else None
-    )
-    system = RESEARCH_SYSTEM if web_search else RESEARCH_SYSTEM_NOSEARCH
+    want_search = node.use_web_search and web_search_enabled and node.kind in ("agent", "review")
+    tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 5}] if want_search else None
+    interval = _NODE_INTERVAL[node.kind]
+    max_tokens = 16000 if node.kind == "synthesize" else 8000
     try:
-        text, final = await _stream_text(
-            system, [{"role": "user", "content": user}],
-            model=model, effort=effort, interval=config.SUBAGENT_HEARTBEAT_INTERVAL,
-            tools=tools, max_tokens=8000, hb=f"subagent:{task.id}",
-        )
+        text, final = await _stream_text(system, user, model=model, effort=effort, interval=interval,
+                                          tools=tools, max_tokens=max_tokens, hb=f"{node.kind}:{node.id}")
     except ApplicationError as e:
-        # Web search not enabled on this account → retry once without tools.
-        if web_search and getattr(e, "type", None) == "BadRequest":
-            text, final = await _stream_text(
-                RESEARCH_SYSTEM_NOSEARCH, [{"role": "user", "content": user}],
-                model=model, effort=effort, interval=config.SUBAGENT_HEARTBEAT_INTERVAL,
-                tools=None, max_tokens=8000, hb=f"subagent:{task.id}",
-            )
+        if tools and getattr(e, "type", None) == "BadRequest":  # web search unavailable -> retry w/o tools
+            text, final = await _stream_text(system, user, model=model, effort=effort, interval=interval,
+                                             tools=None, max_tokens=max_tokens, hb=f"{node.kind}:{node.id}")
         else:
             raise
-    sources = _dedupe(_extract_search_sources(final) + _URL_RE.findall(text))[:10]
-    return SubAgentResult(
-        id=task.id,
-        title=task.title,
-        findings=text or "(no findings produced)",
-        sources=sources,
-        confidence=_extract_confidence(text),
-    )
-
-
-async def review(
-    goal: str, strategy: str, findings: list[SubAgentResult], iteration: int, max_iterations: int,
-    *, model: str, effort: str,
-) -> ReviewResult:
-    user = (
-        f"Research goal: {goal}\n\nPlanned strategy: {strategy}\n\n"
-        f"This is review pass {iteration + 1} of at most {max_iterations}.\n\n"
-        f"Subagent findings to scrutinize:\n\n{_findings_block(findings)}"
-    )
-    data = await _structured(
-        REVIEW_SYSTEM, user, REVIEW_SCHEMA, model=model, effort=effort,
-        interval=config.REVIEW_HEARTBEAT_INTERVAL,
-    )
-    followups = [
-        SubAgentTask(id=0, title=t["title"], question=t["question"], search_hint=t.get("search_hint", ""))
-        for t in (data.get("followup_tasks") or [])
-    ]
-    return ReviewResult(
-        satisfied=bool(data.get("satisfied")),
-        critique=data.get("critique", ""),
-        gaps=list(data.get("gaps") or []),
-        followup_tasks=followups,
-    )
-
-
-async def synthesize(
-    goal: str, history: list[Turn], findings: list[SubAgentResult], review_result: ReviewResult | None,
-    *, model: str, effort: str,
-) -> str:
-    critique = ""
-    if review_result is not None:
-        critique = (
-            f"Reviewer verdict: {'satisfied' if review_result.satisfied else 'gaps remained'}\n"
-            f"Reviewer critique: {review_result.critique}\n"
-        )
-        if review_result.gaps:
-            critique += "Known gaps to acknowledge: " + "; ".join(review_result.gaps) + "\n"
-    user = (
-        _history_block(history)
-        + f"Research goal: {goal}\n\n{critique}\n"
-        + f"Subagent findings:\n\n{_findings_block(findings)}\n\n"
-        + "Write the final verified report."
-    )
-    text, _ = await _stream_text(
-        SYNTH_SYSTEM, [{"role": "user", "content": user}],
-        model=model, effort=effort, interval=config.SYNTH_HEARTBEAT_INTERVAL,
-        tools=None, max_tokens=20000, hb="synthesize",
-    )
-    return text or "(synthesis produced no text)"
+    sources = _dedupe(_extract_search_sources(final) + _URL_RE.findall(text))[:10] if tools else []
+    confidence = _extract_confidence(text) if node.kind == "agent" else None
+    return NodeResult(id=node.id, kind=node.kind, title=node.title,
+                      output=text or "(no output produced)", sources=sources, confidence=confidence)

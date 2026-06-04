@@ -15,13 +15,15 @@ subagents, has them cross-check each other, and returns a verified result. It ha
 This sample keeps the good part - **Claude plans the work** - and moves the *execution* onto Temporal:
 
 - **Durable.** The run's state lives on the Temporal server, not in a process. Crash a worker,
-  deploy, or reboot, and the run continues exactly where it left off - finished subagents are never redone.
-- **Scalable.** Subagents run as independent jobs across your workers. No 16-agent cap - add workers
+  deploy, or reboot, and the run continues exactly where it left off - finished steps are never redone.
+- **Scalable.** Each step runs as its own job across your workers. No 16-agent cap - add workers
   and the fan-out spreads across more machines.
 
-> **Claude plans, Temporal executes.** Claude writes the plan (the "dynamic workflow"); a durable
-> Temporal workflow runs it - fanning subagents out, cross-checking, iterating when there are gaps,
-> and synthesizing a verified report.
+> **Claude plans the DAG, Temporal executes it.** For *any* task, Claude returns a plan as a directed
+> graph of typed steps - `agent` (a worker), `review` (adversarial cross-check), `synthesize` (the final
+> answer) - wired by dependencies. You approve the plan (y/N), then a durable Temporal workflow runs it:
+> every node becomes its own child workflow that calls Claude, independent nodes run in parallel, and
+> every result is recorded so a crash resumes mid-run.
 
 | | Claude Code dynamic workflows | This sample (Temporal) |
 |---|---|---|
@@ -39,20 +41,21 @@ developer-written, repeatable code drives the *execution*. See the
 ## How it works
 
 Press enter in the chat client and it starts one durable Temporal workflow - the agent loop for that
-chat. Each turn runs five stages:
+chat. Each task runs three stages:
 
-1. **Plan** - ask Claude for a structured plan: the sub-questions to research, how to fan them out,
-   and what to double-check. *(This is the dynamic workflow Claude authors.)*
-2. **Fan out** - run each sub-question as its own subagent (Claude + web search), in parallel, across
-   your workers.
-3. **Review** - a separate Claude pass adversarially cross-checks the findings for gaps and contradictions.
-4. **Refine** - if the review isn't satisfied, the plan changes and another round runs (bounded by `--max-iterations`).
-5. **Synthesize** - Claude writes the final, verified report.
+1. **Plan** - ask Claude to design the workflow as a DAG of typed nodes - `agent` (a worker),
+   `review` (adversarial cross-check), `synthesize` (final answer) - wired by dependencies.
+   *(This is the dynamic workflow Claude authors - as data, not code.)*
+2. **Approve** - the plan is shown to you and you approve it (y/N), mirroring Claude Code's "approve
+   the plan before it runs". One-shot `--once` auto-approves.
+3. **Execute** - a durable DAG interpreter runs the graph: every node becomes its own child workflow
+   that calls Claude, nodes with no unmet dependencies run in parallel, and dependents wait for their
+   inputs. The plan's `output` node holds the final answer.
 
-Every plan and result is saved on the Temporal server as it happens - which is what makes the whole
-run crash-proof and resumable.
+Every plan and node result is saved on the Temporal server as it happens - which is what makes the
+whole run crash-proof and resumable.
 
-In **live mode**, each stage is a real round-trip to Claude, while Temporal owns the control flow and
+In **live mode**, each node is a real round-trip to Claude, while Temporal owns the control flow and
 records every result:
 
 ```mermaid
@@ -60,39 +63,31 @@ sequenceDiagram
     autonumber
     actor U as You (CLI)
     participant W as Temporal workflow (agent loop)
-    participant S as Subagent child workflows
+    participant N as Node child workflows
     participant C as Claude (Anthropic API)
 
-    U->>W: enter a goal - submit_prompt(goal)
+    U->>W: enter a task - submit_prompt(task)
 
-    Note over W,C: 1 · PLAN
-    W->>C: plan_workflow(goal)
-    C-->>W: Plan - strategy + N subagent tasks
+    Note over W,C: PLAN
+    W->>C: plan_workflow(task)
+    C-->>W: WorkflowPlan - a DAG of typed nodes (agent / review / synthesize)
 
-    loop each round (up to max_iterations)
-        Note over W,S: 2 · RESEARCH - fan out one child workflow per task
-        W->>S: start N subagents
-        par for each task, in parallel
-            S->>C: run_subagent(question) + web_search
-            C-->>S: findings + sources + confidence
+    Note over U,W: APPROVE  (--once auto-approves)
+    W-->>U: show the plan
+    U->>W: approve_plan(yes)
+
+    Note over W,N: EXECUTE - durable DAG interpreter, topological waves
+    loop until every node is done
+        W->>N: start the ready nodes (one child workflow each)
+        par nodes with no unmet deps run in parallel
+            N->>C: run_node(instruction) [+ web_search for agent/review]
+            C-->>N: output (+ sources / confidence)
         end
-        S-->>W: all subagent results
-
-        Note over W,C: 3 · REVIEW - adversarial cross-check
-        W->>C: adversarial_review(all findings)
-        C-->>W: satisfied? + gaps + follow-up tasks
-
-        alt not satisfied and rounds remain
-            Note over W: 4 · REFINE - next plan = follow-up tasks, loop again
-        end
+        N-->>W: node results feed their dependents
     end
 
-    Note over W,C: 5 · SYNTHESIZE
-    W->>C: synthesize_report(findings + review)
-    C-->>W: final verified report
-    W-->>U: report (client polls get_state to render live progress)
-
-    Note over W: every Claude result is recorded in Event History, so<br/>a worker crash resumes mid-run without redoing finished work
+    W-->>U: the output node's result (client polls get_state to render live)
+    Note over W: every node result is recorded in Event History, so<br/>a worker crash resumes mid-run without redoing finished nodes
 ```
 ---
 
@@ -115,14 +110,15 @@ uv run python worker.py      # 2) a worker (run more for more parallel subagents
 uv run python client.py      # 3) the chat client
 ```
 
-Type a research goal at the `temporal ❯` prompt and watch it run; the client prints a link to the
+Type a task at the `temporal >` prompt; Claude plans a workflow, you approve it (y/N), and it runs.
+The client prints a link to the
 live execution in the Web UI. For a one-shot run instead of the chat loop:
 
 ```bash
 uv run python client.py --once "What's the state of durable execution for AI agents in 2026?"
 ```
 
-Useful flags: `--max-iterations`, `--max-subagents`, `--session-id`, `--address`.
+Useful flags: `--max-nodes` (cap on plan size), `--yes` (auto-approve plans in interactive mode), `--session-id`, `--address`.
 
 ---
 
@@ -179,8 +175,8 @@ While the subagents run, **kill the worker** (`Ctrl-C`, or `kill -9` for a hard 
 | `ANTHROPIC_API_KEY` | - | required for real Claude; omit for mock mode |
 | `TEMPORAL_ADDRESS` / `TEMPORAL_NAMESPACE` | `localhost:7233` / `default` | local dev server, or your Temporal Cloud endpoint/namespace |
 | `TEMPORAL_API_KEY` | - | set it to use **Temporal Cloud** (TLS automatic); or `TEMPORAL_TLS=true` for self-hosted TLS |
-| `PLANNER_MODEL` / `SUBAGENT_MODEL` / `REVIEW_MODEL` / `SYNTH_MODEL` | `claude-opus-4-8` | e.g. `SUBAGENT_MODEL=claude-haiku-4-5` for a cheaper fan-out |
-| `ENABLE_WEB_SEARCH` | `true` | subagents use Claude's web search (falls back if unavailable) |
+| `PLANNER_MODEL` / `AGENT_MODEL` / `REVIEW_MODEL` / `SYNTH_MODEL` | `claude-opus-4-8` | e.g. `AGENT_MODEL=claude-haiku-4-5` for a cheaper fan-out |
+| `ENABLE_WEB_SEARCH` | `true` | agent/review nodes use Claude's web search (falls back if unavailable) |
 | `DURABLE_CLAUDE_MOCK` | - | set to `1` to force mock mode even with a key |
 
 **Temporal Cloud:** set `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, and `TEMPORAL_API_KEY` in `.env`
@@ -193,10 +189,10 @@ client banners show `auth=api-key` so you know you're on Cloud.
 
 ```
 config.py      configuration (Temporal address, models, mock toggle), read from .env
-models.py      data shared between the workflow, activities, and client
+models.py      shared models, incl. the WorkflowPlan DAG + its JSON schema
 claude_llm.py  the only module that calls Claude (Anthropic SDK)
-activities.py  the four Claude steps (plan / research / review / synthesize) + mock mode
-workflows.py   the durable agent-loop workflow + the per-subagent workflow
+activities.py  plan_workflow (Claude designs the DAG) + run_node (agent / review / synthesize) + mock
+workflows.py   the durable agent-loop workflow (plan -> approve -> DAG executor) + NodeWorkflow (one child workflow per node)
 worker.py      runs a Temporal worker
 client.py      the Temporal-branded chat client
 ```

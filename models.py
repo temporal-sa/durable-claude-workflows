@@ -1,7 +1,11 @@
-"""Shared data models (Pydantic) and JSON schemas.
+"""Shared data models (Pydantic) and the plan JSON schema.
+
+The "dynamic workflow" Claude authors is a **plan**: a directed acyclic graph of
+typed nodes (`agent` / `review` / `synthesize`) with dependencies. Temporal runs
+the graph durably - each node becomes a child workflow that calls Claude.
 
 These cross the workflow/activity/client boundary, so they're serialized by
-Temporal's ``pydantic_data_converter``. Keep this module dependency-light — it's
+Temporal's ``pydantic_data_converter``. Keep this module dependency-light - it's
 imported into the workflow sandbox (through a pass-through import).
 """
 
@@ -11,44 +15,36 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
-Phase = Literal[
-    "planning", "researching", "reviewing", "refining", "synthesizing", "done", "error"
-]
-SubStatus = Literal["pending", "running", "done", "failed"]
+NodeKind = Literal["agent", "review", "synthesize"]
+Phase = Literal["planning", "awaiting_approval", "running", "done", "error", "cancelled"]
+NodeStatus = Literal["pending", "running", "done", "failed"]
 
 
-# --- The plan Claude authors (the "dynamic workflow") ----------------------
-class SubAgentTask(BaseModel):
-    """One unit of the fan-out — researched by its own child workflow."""
-
-    id: int = 0
-    title: str
-    question: str
-    search_hint: str = ""
-
-
-class Plan(BaseModel):
-    """What the planner activity returns: the orchestration Temporal will run."""
-
-    strategy: str
-    review_focus: str
-    tasks: list[SubAgentTask] = Field(default_factory=list)
+# --- The plan Claude authors (the "dynamic workflow" as a DAG) --------------
+class PlanNode(BaseModel):
+    id: str                                       # stable, unique (e.g. "a1", "review", "final")
+    kind: NodeKind                                # agent | review | synthesize
+    title: str                                    # short label
+    instruction: str                              # what this node should do
+    depends_on: list[str] = Field(default_factory=list)  # ids whose results feed this node
+    use_web_search: bool = False
 
 
-class SubAgentResult(BaseModel):
-    id: int
-    title: str
-    findings: str = ""
+class WorkflowPlan(BaseModel):
+    title: str = ""
+    summary: str = ""                             # 1-2 sentences, shown at the approval prompt
+    nodes: list[PlanNode] = Field(default_factory=list)
+    output: str = ""                              # id of the node whose result is the final answer
+
+
+class NodeResult(BaseModel):
+    id: str
+    kind: NodeKind
+    title: str = ""
+    output: str = ""
     sources: list[str] = Field(default_factory=list)
-    confidence: float = 0.0
+    confidence: Optional[float] = None
     error: Optional[str] = None
-
-
-class ReviewResult(BaseModel):
-    satisfied: bool
-    critique: str = ""
-    gaps: list[str] = Field(default_factory=list)
-    followup_tasks: list[SubAgentTask] = Field(default_factory=list)
 
 
 class Turn(BaseModel):
@@ -56,12 +52,15 @@ class Turn(BaseModel):
     content: str
 
 
-# --- Live progress, exposed via the workflow query -------------------------
-class SubAgentProgress(BaseModel):
-    id: int
+# --- Live progress, exposed via the workflow query --------------------------
+class NodeProgress(BaseModel):
+    id: str
+    kind: NodeKind
     title: str
-    status: SubStatus = "pending"
-    workflow_id: Optional[str] = None  # the child workflow execution (visible in the Temporal UI)
+    instruction: str = ""
+    depends_on: list[str] = Field(default_factory=list)
+    status: NodeStatus = "pending"
+    workflow_id: Optional[str] = None             # the node's child workflow (visible in the Temporal UI)
     confidence: Optional[float] = None
     note: Optional[str] = None
 
@@ -70,16 +69,15 @@ class TurnProgress(BaseModel):
     index: int
     user_prompt: str
     phase: Phase = "planning"
-    strategy: Optional[str] = None
-    iteration: int = 0
-    max_iterations: int = 1
-    subagents: list[SubAgentProgress] = Field(default_factory=list)
+    plan_title: Optional[str] = None
+    plan_summary: Optional[str] = None
+    nodes: list[NodeProgress] = Field(default_factory=list)
     report: Optional[str] = None
     error: Optional[str] = None
 
 
 class AgentSnapshot(BaseModel):
-    """Return type of the ``get_state`` query — drives the chat client UI."""
+    """Return type of the ``get_state`` query - drives the chat client UI."""
 
     session_id: str
     task_queue: str
@@ -95,8 +93,8 @@ class AgentSnapshot(BaseModel):
 class StartRequest(BaseModel):
     session_id: str
     initial_prompt: Optional[str] = None
-    max_iterations: int = 2
-    max_subagents: int = 5
+    auto_approve: bool = False                    # one-shot mode approves the plan automatically
+    max_nodes: int = 10
     mock: bool = False
     models: dict[str, str] = Field(default_factory=dict)
     # Carried across continue-as-new to bound Event History on long chats.
@@ -108,78 +106,44 @@ class StartRequest(BaseModel):
 class PlanInput(BaseModel):
     goal: str
     history: list[Turn] = Field(default_factory=list)
-    max_subagents: int = 5
+    max_nodes: int = 10
 
 
-class ResearchInput(BaseModel):
+class NodeRunInput(BaseModel):
     goal: str
-    task: SubAgentTask
+    node: PlanNode
+    upstream: list[NodeResult] = Field(default_factory=list)  # results of this node's depends_on
 
 
-class ReviewInput(BaseModel):
-    goal: str
-    strategy: str
-    findings: list[SubAgentResult] = Field(default_factory=list)
-    iteration: int = 0
-    max_iterations: int = 1
-
-
-class SynthesisInput(BaseModel):
-    goal: str
-    history: list[Turn] = Field(default_factory=list)
-    findings: list[SubAgentResult] = Field(default_factory=list)
-    review: Optional[ReviewResult] = None
-
-
-# --- JSON schemas for Claude structured outputs ----------------------------
-# Hand-written so they satisfy the structured-output constraints
-# (additionalProperties:false, no min/max/length keywords). Claude returns the
-# JSON; we assign task ids ourselves afterwards.
-_TASK_SCHEMA = {
+# --- JSON schema for Claude's structured plan output -----------------------
+# Hand-written to satisfy the structured-output constraints (additionalProperties:false,
+# no min/max keywords). Claude returns the graph; we validate + normalize it.
+_NODE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "title": {"type": "string", "description": "Short label, 3-6 words"},
-        "question": {
-            "type": "string",
-            "description": "The focused, independently-researchable sub-question",
+        "id": {"type": "string", "description": "Stable unique id, e.g. a1, review, final"},
+        "kind": {"type": "string", "enum": ["agent", "review", "synthesize"]},
+        "title": {"type": "string", "description": "Short label, 2-6 words"},
+        "instruction": {"type": "string", "description": "What this step should do"},
+        "depends_on": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "ids of steps whose outputs feed this one; empty = runs immediately",
         },
-        "search_hint": {
-            "type": "string",
-            "description": "What to search for / which kinds of sources to prioritize",
-        },
+        "use_web_search": {"type": "boolean", "description": "true if this step needs current/external info"},
     },
-    "required": ["title", "question", "search_hint"],
+    "required": ["id", "kind", "title", "instruction", "depends_on", "use_web_search"],
 }
 
 PLAN_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "strategy": {
-            "type": "string",
-            "description": "1-2 sentences describing the overall research approach",
-        },
-        "review_focus": {
-            "type": "string",
-            "description": "What the adversarial reviewer should scrutinize most",
-        },
-        "tasks": {"type": "array", "items": _TASK_SCHEMA},
+        "title": {"type": "string", "description": "Short title for the workflow"},
+        "summary": {"type": "string", "description": "1-2 sentence plain-English description of the plan"},
+        "nodes": {"type": "array", "items": _NODE_SCHEMA},
+        "output": {"type": "string", "description": "id of the node whose result is the final deliverable"},
     },
-    "required": ["strategy", "review_focus", "tasks"],
-}
-
-REVIEW_SCHEMA = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        "satisfied": {
-            "type": "boolean",
-            "description": "True if the evidence is sufficient to synthesize a verified answer",
-        },
-        "critique": {"type": "string"},
-        "gaps": {"type": "array", "items": {"type": "string"}},
-        "followup_tasks": {"type": "array", "items": _TASK_SCHEMA},
-    },
-    "required": ["satisfied", "critique", "gaps", "followup_tasks"],
+    "required": ["title", "summary", "nodes", "output"],
 }

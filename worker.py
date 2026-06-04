@@ -1,8 +1,7 @@
-"""Temporal worker — hosts the workflows and activities.
+"""Temporal worker - hosts the workflows and activities.
 
-Run several of these (same task queue) to scale the subagent fan-out across
-machines: "just add workers." All four activities are async, so no
-ThreadPoolExecutor is needed.
+Run several of these (same task queue) to scale the node fan-out across machines.
+All activities are async, so no ThreadPoolExecutor is needed.
 
     uv run python worker.py
 """
@@ -16,27 +15,21 @@ from temporalio.worker import Worker
 from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxRestrictions
 
 import config
-from activities import (
-    adversarial_review,
-    plan_workflow,
-    run_subagent,
-    synthesize_report,
-)
-from workflows import DurableClaudeAgentWorkflow, ResearchSubagentWorkflow
+from activities import plan_workflow, run_node
+from workflows import DurableClaudeAgentWorkflow, NodeWorkflow
 
 
 def _banner() -> None:
-    mode = "MOCK (simulated Claude — set ANTHROPIC_API_KEY for live)" if config.mock_mode() else "LIVE"
-    models = config.model_summary()
-    print("┌─ Durable Claude Workflows — worker ────────────────────────────")
-    print(f"│  Temporal : {config.TEMPORAL_ADDRESS}  ns={config.TEMPORAL_NAMESPACE}  auth={config.temporal_auth_mode()}")
-    print(f"│  Queue    : {config.TASK_QUEUE}")
-    print(f"│  Mode     : {mode}")
-    print(f"│  Models   : planner={models['planner']} subagent={models['subagent']} "
-          f"reviewer={models['reviewer']} synth={models['synthesizer']}")
+    mode = "MOCK (simulated Claude - set ANTHROPIC_API_KEY for live)" if config.mock_mode() else "LIVE"
+    m = config.model_summary()
+    print("+- Durable Claude Workflows - worker ----------------------------")
+    print(f"|  Temporal : {config.TEMPORAL_ADDRESS}  ns={config.TEMPORAL_NAMESPACE}  auth={config.temporal_auth_mode()}")
+    print(f"|  Queue    : {config.TASK_QUEUE}")
+    print(f"|  Mode     : {mode}")
+    print(f"|  Models   : planner={m['planner']} agent={m['agent']} reviewer={m['reviewer']} synth={m['synthesizer']}")
     if not config.mock_mode():
-        print(f"│  WebSearch: {'on' if config.ENABLE_WEB_SEARCH else 'off'}")
-    print("└─ waiting for work (Ctrl-C to stop) ────────────────────────────", flush=True)
+        print(f"|  WebSearch: {'on' if config.ENABLE_WEB_SEARCH else 'off'}")
+    print("+- waiting for work (Ctrl-C to stop) ----------------------------", flush=True)
 
 
 async def main() -> None:
@@ -48,14 +41,14 @@ async def main() -> None:
     runner = SandboxedWorkflowRunner(
         restrictions=SandboxRestrictions.default.with_passthrough_modules("pydantic", "pydantic_core")
     )
-    # Worker.run() performs a one-time namespace-validation RPC at startup; a
-    # freshly started dev server can answer it with a transient error. Retry briefly.
+    # Worker.run() performs a one-time namespace-validation RPC at startup; a freshly
+    # started dev server can answer it with a transient error. Retry briefly.
     for attempt in range(1, 11):
         worker = Worker(
             client,
             task_queue=config.TASK_QUEUE,
-            workflows=[DurableClaudeAgentWorkflow, ResearchSubagentWorkflow],
-            activities=[plan_workflow, run_subagent, adversarial_review, synthesize_report],
+            workflows=[DurableClaudeAgentWorkflow, NodeWorkflow],
+            activities=[plan_workflow, run_node],
             workflow_runner=runner,
             max_concurrent_activities=64,
         )
@@ -64,7 +57,7 @@ async def main() -> None:
             return
         except RuntimeError as e:
             if "validation failed" in str(e).lower() and attempt < 10:
-                logging.warning("worker startup transient (attempt %d/10), retrying in 2s…", attempt)
+                logging.warning("worker startup transient (attempt %d/10), retrying in 2s...", attempt)
                 await asyncio.sleep(2)
                 continue
             raise
