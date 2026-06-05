@@ -28,6 +28,7 @@ class PlanNode(BaseModel):
     instruction: str                              # what this node should do
     depends_on: list[str] = Field(default_factory=list)  # ids whose results feed this node
     use_web_search: bool = False
+    use_filesystem: bool = False                  # true => read/write files + run bash (coding)
 
 
 class WorkflowPlan(BaseModel):
@@ -59,6 +60,7 @@ class NodeProgress(BaseModel):
     title: str
     instruction: str = ""
     depends_on: list[str] = Field(default_factory=list)
+    use_filesystem: bool = False
     status: NodeStatus = "pending"
     workflow_id: Optional[str] = None             # the node's child workflow (visible in the Temporal UI)
     confidence: Optional[float] = None
@@ -132,8 +134,10 @@ _NODE_SCHEMA = {
             "description": "ids of steps whose outputs feed this one; empty = runs immediately",
         },
         "use_web_search": {"type": "boolean", "description": "true if this step needs current/external info"},
+        "use_filesystem": {"type": "boolean",
+                           "description": "true if this step must read/write files or run shell commands (e.g. coding)"},
     },
-    "required": ["id", "kind", "title", "instruction", "depends_on", "use_web_search"],
+    "required": ["id", "kind", "title", "instruction", "depends_on", "use_web_search", "use_filesystem"],
 }
 
 PLAN_SCHEMA = {

@@ -55,6 +55,12 @@ chat. Each task runs three stages:
 Every plan and node result is saved on the Temporal server as it happens - which is what makes the
 whole run crash-proof and resumable.
 
+> **Coding workflows.** When the plan marks a step `use_filesystem`, that agent gets Claude's bash and
+> text-editor tools and writes real files into a confined workspace on the worker - so a plan can build
+> software, not just prose. All writes are confined to `DURABLE_CLAUDE_WORKSPACE`, so set it to the
+> directory where you want the generated code to land (it must contain any path the task targets); the
+> default is `./dcw_workspace`. Files land on the worker's host. Set `ENABLE_FILE_TOOLS=false` to turn it off.
+
 In **live mode**, each node is a real round-trip to Claude, while Temporal owns the control flow and
 records every result:
 
@@ -177,6 +183,8 @@ While the subagents run, **kill the worker** (`Ctrl-C`, or `kill -9` for a hard 
 | `TEMPORAL_API_KEY` | - | set it to use **Temporal Cloud** (TLS automatic); or `TEMPORAL_TLS=true` for self-hosted TLS |
 | `PLANNER_MODEL` / `AGENT_MODEL` / `REVIEW_MODEL` / `SYNTH_MODEL` | `claude-opus-4-8` | e.g. `AGENT_MODEL=claude-haiku-4-5` for a cheaper fan-out |
 | `ENABLE_WEB_SEARCH` | `true` | agent/review nodes use Claude's web search (falls back if unavailable) |
+| `ENABLE_FILE_TOOLS` | `true` | agent steps marked `use_filesystem` get bash + the text editor, so coding workflows write real files |
+| `DURABLE_CLAUDE_WORKSPACE` | `./dcw_workspace` | the working directory those file/bash tools are confined to |
 | `DURABLE_CLAUDE_MOCK` | - | set to `1` to force mock mode even with a key |
 
 **Temporal Cloud:** set `TEMPORAL_ADDRESS`, `TEMPORAL_NAMESPACE`, and `TEMPORAL_API_KEY` in `.env`

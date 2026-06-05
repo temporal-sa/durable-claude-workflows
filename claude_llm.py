@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import re
 
 import anthropic
@@ -251,10 +252,12 @@ PLAN_SYSTEM = (
     "will execute, fanning independent steps out in parallel.\n\n"
     "Node kinds:\n"
     "- \"agent\": a worker that performs one focused piece of the task by reasoning (and optional "
-    "web search). Use several independent agents (empty depends_on) for parts that can run in parallel.\n"
+    "web search). ONLY agent steps can read/write files and run shell commands (via use_filesystem). "
+    "Use several independent agents (empty depends_on) for parts that can run in parallel.\n"
     "- \"review\": adversarially cross-checks / validates the outputs of the steps it depends on "
-    "(finds gaps, errors, contradictions).\n"
-    "- \"synthesize\": produces the final deliverable from the steps it depends on.\n\n"
+    "(finds gaps, errors, contradictions). Reads upstream text only; it cannot touch the filesystem.\n"
+    "- \"synthesize\": writes the final SUMMARY/answer text from the steps it depends on. It also cannot "
+    "touch the filesystem, so never put file-writing, build, or fix-applying steps here.\n\n"
     "Rules:\n"
     "- Use {max_nodes} nodes or fewer. Give each a short unique id (e.g. a1, a2, review, final), a "
     "short title, and a clear instruction.\n"
@@ -262,6 +265,12 @@ PLAN_SYSTEM = (
     "- Include at least one \"review\" step that depends on the agent steps, and exactly one final "
     "\"synthesize\" step (set it as `output`) that depends on the review.\n"
     "- Set use_web_search=true on steps that need current or external information; false otherwise.\n"
+    "- For tasks that PRODUCE files (writing code/software, generating a project): EVERY step that creates, "
+    "edits, or runs files MUST be an \"agent\" with use_filesystem=true. Those steps share ONE working "
+    "directory, so later steps can read what earlier steps wrote; when file-writing steps run in parallel, "
+    "give each its own subdirectory so they do not clobber shared files. The final assembly/build/test step "
+    "that writes files must also be an \"agent\" with use_filesystem=true (NOT synthesize). Use the single "
+    "synthesize step only for a short text summary of what was built and how to run it.\n"
     "- It MUST be a DAG (no cycles). Tailor the steps to the actual task - this is not limited to research.\n"
     "Respond ONLY with the JSON object matching the provided schema."
 )
@@ -310,6 +319,7 @@ def _normalize_plan(data: dict, goal: str, max_nodes: int) -> WorkflowPlan:
             instruction=str(n.get("instruction") or goal),
             depends_on=[str(d) for d in (n.get("depends_on") or [])],
             use_web_search=bool(n.get("use_web_search", False)),
+            use_filesystem=bool(n.get("use_filesystem", False)) and kind == "agent",
         ))
 
     if not nodes:  # never hand Temporal an empty graph
@@ -378,26 +388,169 @@ _NODE_INTERVAL = {
     "synthesize": config.SYNTH_HEARTBEAT_INTERVAL,
 }
 
+_WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 5}
+_BASH_TOOL = {"type": "bash_20250124", "name": "bash"}
+_EDITOR_TOOL = {"type": "text_editor_20250728", "name": "str_replace_based_edit_tool"}
+
+AGENT_SYSTEM_CODING = (
+    "You are a worker agent in a workflow that CAN read, write, and edit files and run shell commands. "
+    "Your working directory - the only place you may touch - is:\n  {workspace}\n"
+    "Actually create and modify files there using the text editor tool (view / create / str_replace / "
+    "insert) and run commands with bash. Do NOT just print code in your reply - code only counts if it is "
+    "written to disk with the tools. Earlier steps may have already written files here, so view or `ls` the "
+    "directory first and build on what exists rather than overwriting it. Use paths inside the working "
+    "directory (relative paths are fine); if your instruction names an absolute path, treat THIS working "
+    "directory as that location. When you finish, syntax-check or run what you wrote if practical, then end "
+    "with a short summary listing the files you created or changed."
+)
+
+
+# --- Local tool executors (run inside the activity, on the worker's disk) ---
+def _safe_path(workspace: str, path: str) -> str | None:
+    p = path if os.path.isabs(path) else os.path.join(workspace, path)
+    rp = os.path.realpath(p)
+    root = os.path.realpath(workspace)
+    return rp if rp == root or rp.startswith(root + os.sep) else None
+
+
+async def _run_bash(command: str, workspace: str, timeout: float = 120.0) -> tuple[str, bool]:
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            command, cwd=workspace,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    except Exception as e:  # noqa: BLE001
+        return f"bash error: {e}", True
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return f"(bash timed out after {timeout:.0f}s)", True
+    text = (out or b"").decode("utf-8", "replace")
+    if len(text) > 16000:
+        text = text[:16000] + "\n...(truncated)"
+    return text or f"(exit {proc.returncode}, no output)", proc.returncode != 0
+
+
+def _text_editor(inp: dict, workspace: str) -> tuple[str, bool]:
+    cmd = inp.get("command")
+    rp = _safe_path(workspace, inp.get("path", ""))
+    if rp is None:
+        return f"Error: path is outside the working directory ({workspace}). Use paths within it.", True
+    try:
+        if cmd == "view":
+            if os.path.isdir(rp):
+                return "\n".join(sorted(os.listdir(rp))) or "(empty directory)", False
+            lines = open(rp, encoding="utf-8", errors="replace").read().splitlines()
+            vr = inp.get("view_range")
+            start = 1
+            if isinstance(vr, list) and len(vr) == 2:
+                s, e = vr
+                e = len(lines) if e == -1 else e
+                lines, start = lines[max(0, s - 1):e], max(1, s)
+            return "\n".join(f"{start + i}\t{ln}" for i, ln in enumerate(lines)) or "(empty file)", False
+        if cmd == "create":
+            os.makedirs(os.path.dirname(rp) or ".", exist_ok=True)
+            with open(rp, "w", encoding="utf-8") as f:
+                f.write(inp.get("file_text", ""))
+            return f"Created {inp.get('path')}", False
+        if cmd == "str_replace":
+            content = open(rp, encoding="utf-8").read()
+            old = inp.get("old_str", "")
+            n = content.count(old)
+            if n != 1:
+                return f"Error: old_str must match exactly once (matched {n}).", True
+            with open(rp, "w", encoding="utf-8") as f:
+                f.write(content.replace(old, inp.get("new_str", ""), 1))
+            return f"Edited {inp.get('path')}", False
+        if cmd == "insert":
+            lines = open(rp, encoding="utf-8").readlines()
+            new = inp.get("new_str", "")
+            if not new.endswith("\n"):
+                new += "\n"
+            lines.insert(min(int(inp.get("insert_line", 0)), len(lines)), new)
+            with open(rp, "w", encoding="utf-8") as f:
+                f.writelines(lines)
+            return f"Inserted into {inp.get('path')}", False
+        return f"Error: unsupported text-editor command '{cmd}'", True
+    except FileNotFoundError:
+        return f"Error: file not found: {inp.get('path')}", True
+    except Exception as e:  # noqa: BLE001
+        return f"Error: {e}", True
+
+
+async def _agentic(system: str, user: str, *, model: str, effort: str, interval: float, hb: str,
+                   tools: list[dict], workspace: str, max_iters: int = 30) -> str:
+    """Run Claude with client-side bash / text-editor tools, executing each tool call on
+    the worker's filesystem and feeding results back, until Claude is done."""
+    client = _client()
+    messages: list[dict] = [{"role": "user", "content": user}]
+    text_parts: list[str] = []
+    try:
+        async with heartbeater(interval, hb):
+            for _ in range(max_iters):
+                resp = await client.messages.create(
+                    model=model, max_tokens=16000, system=_system(system), messages=messages,
+                    tools=tools, thinking={"type": "adaptive"}, output_config={"effort": effort})
+                for b in resp.content:
+                    if getattr(b, "type", None) == "text":
+                        text_parts.append(b.text)
+                if resp.stop_reason == "tool_use":
+                    messages.append({"role": "assistant", "content": resp.content})
+                    results = []
+                    for b in resp.content:
+                        if getattr(b, "type", None) != "tool_use":
+                            continue
+                        activity.heartbeat(hb)
+                        if b.name == "bash":
+                            out, err = (("(shell restarted)", False) if b.input.get("restart")
+                                        else await _run_bash(b.input.get("command", ""), workspace))
+                        else:  # text editor
+                            out, err = _text_editor(b.input, workspace)
+                        results.append({"type": "tool_result", "tool_use_id": b.id, "content": out, "is_error": err})
+                    messages.append({"role": "user", "content": results})
+                    continue
+                if resp.stop_reason == "pause_turn":  # server tool (web_search) mid-loop
+                    messages.append({"role": "assistant", "content": resp.content})
+                    continue
+                break
+    except Exception as e:  # noqa: BLE001
+        raise _map_error(e)
+    return "".join(text_parts).strip()
+
 
 async def run_node(goal: str, node: PlanNode, upstream: list[NodeResult], *, model: str, effort: str,
                    web_search_enabled: bool) -> NodeResult:
-    system = _NODE_SYSTEM[node.kind]
     user = (
         f"Overall goal: {goal}\n\n"
         f"{_upstream_block(upstream)}"
         f"Your step ({node.kind}): {node.title}\n{node.instruction}"
     )
-    want_search = node.use_web_search and web_search_enabled and node.kind in ("agent", "review")
-    tools = [{"type": "web_search_20260209", "name": "web_search", "max_uses": 5}] if want_search else None
     interval = _NODE_INTERVAL[node.kind]
+    want_search = node.use_web_search and web_search_enabled and node.kind in ("agent", "review")
+    want_fs = node.use_filesystem and config.ENABLE_FILE_TOOLS and node.kind == "agent"
+
+    # Coding path: bash + text editor (+ optional web search), executed on the worker's disk.
+    if want_fs:
+        ws = config.workspace_dir()
+        tools = [_BASH_TOOL, _EDITOR_TOOL] + ([_WEB_SEARCH_TOOL] if want_search else [])
+        text = await _agentic(AGENT_SYSTEM_CODING.format(workspace=ws), user, model=model, effort=effort,
+                              interval=interval, hb=f"{node.kind}:{node.id}", tools=tools, workspace=ws)
+        return NodeResult(id=node.id, kind=node.kind, title=node.title,
+                          output=text or "(no output produced)",
+                          sources=_dedupe(_URL_RE.findall(text))[:10], confidence=_extract_confidence(text))
+
+    # Text / web-search path (no filesystem).
+    tools = [_WEB_SEARCH_TOOL] if want_search else None
     max_tokens = 16000 if node.kind == "synthesize" else 8000
     try:
-        text, final = await _stream_text(system, user, model=model, effort=effort, interval=interval,
-                                          tools=tools, max_tokens=max_tokens, hb=f"{node.kind}:{node.id}")
+        text, final = await _stream_text(_NODE_SYSTEM[node.kind], user, model=model, effort=effort,
+                                         interval=interval, tools=tools, max_tokens=max_tokens,
+                                         hb=f"{node.kind}:{node.id}")
     except ApplicationError as e:
         if tools and getattr(e, "type", None) == "BadRequest":  # web search unavailable -> retry w/o tools
-            text, final = await _stream_text(system, user, model=model, effort=effort, interval=interval,
-                                             tools=None, max_tokens=max_tokens, hb=f"{node.kind}:{node.id}")
+            text, final = await _stream_text(_NODE_SYSTEM[node.kind], user, model=model, effort=effort,
+                                             interval=interval, tools=None, max_tokens=max_tokens,
+                                             hb=f"{node.kind}:{node.id}")
         else:
             raise
     sources = _dedupe(_extract_search_sources(final) + _URL_RE.findall(text))[:10] if tools else []

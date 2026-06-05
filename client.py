@@ -96,7 +96,8 @@ def render_plan(console: Console, cur: TurnProgress) -> None:
         body.append(Text.from_markup(f"[dim]phase {i}[/]{tag}"))
         for n in wave:
             deps = f"  [dim]<- {', '.join(n.depends_on)}[/]" if n.depends_on else ""
-            body.append(Text.from_markup(f"  {_KIND_TAG.get(n.kind, n.kind)}  {escape(n.title)}{deps}"))
+            files = " [green](files)[/]" if getattr(n, "use_filesystem", False) else ""
+            body.append(Text.from_markup(f"  {_KIND_TAG.get(n.kind, n.kind)}  {escape(n.title)}{files}{deps}"))
             if n.instruction:
                 body.append(Text.from_markup(f"       [dim]{escape(_trunc(n.instruction, 100))}[/]"))
     console.print(

@@ -74,6 +74,20 @@ ENABLE_WEB_SEARCH: bool = os.getenv("ENABLE_WEB_SEARCH", "true").lower() in ("1"
 # crash-recovery demo: kill the worker mid-run, restart, watch the workflow resume.
 MOCK_LATENCY: float = float(os.getenv("DURABLE_CLAUDE_MOCK_LATENCY", "1.2"))
 
+# --- Filesystem / coding tools ---------------------------------------------
+# Agent nodes that set use_filesystem get the Anthropic text-editor (read/write/edit)
+# and bash tools, so coding workflows actually produce files. All ops happen in this
+# workspace dir. WARNING: bash runs with the worker's OS permissions and is only
+# confined to cwd - run the worker in a container/VM for untrusted tasks, or set
+# ENABLE_FILE_TOOLS=false to disable file/bash tools entirely.
+WORKSPACE_DIR: str = os.getenv("DURABLE_CLAUDE_WORKSPACE", os.path.join(os.getcwd(), "dcw_workspace"))
+ENABLE_FILE_TOOLS: bool = os.getenv("ENABLE_FILE_TOOLS", "true").lower() in ("1", "true", "yes")
+
+
+def workspace_dir() -> str:
+    os.makedirs(WORKSPACE_DIR, exist_ok=True)
+    return os.path.realpath(WORKSPACE_DIR)
+
 
 def _is_truthy(name: str) -> bool:
     return os.getenv(name, "").lower() in ("1", "true", "yes")

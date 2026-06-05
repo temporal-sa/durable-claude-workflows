@@ -186,7 +186,8 @@ class DurableClaudeAgentWorkflow:
         cur.plan_title = plan.title
         cur.plan_summary = plan.summary
         cur.nodes = [
-            NodeProgress(id=n.id, kind=n.kind, title=n.title, instruction=n.instruction, depends_on=n.depends_on)
+            NodeProgress(id=n.id, kind=n.kind, title=n.title, instruction=n.instruction,
+                         depends_on=n.depends_on, use_filesystem=n.use_filesystem)
             for n in plan.nodes
         ]
 

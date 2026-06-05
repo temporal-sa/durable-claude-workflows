@@ -12,6 +12,7 @@ DURABLE_CLAUDE_MOCK) to switch to real Claude.
 from __future__ import annotations
 
 import asyncio
+import os
 
 from temporalio import activity
 
@@ -92,6 +93,16 @@ async def _mock_node(inp: NodeRunInput) -> NodeResult:
         await asyncio.sleep(config.MOCK_LATENCY)
 
     if node.kind == "agent":
+        if node.use_filesystem and config.ENABLE_FILE_TOOLS:
+            ws = config.workspace_dir()
+            fname = f"{node.id}.md"
+            with open(os.path.join(ws, fname), "w", encoding="utf-8") as f:
+                f.write(f"# {node.title} (mock)\n\n{_short(node.instruction, 200)}\n")
+            out = (f"- **{node.title}** (mock, coding): wrote `{fname}` to the workspace.\n"
+                   f"- In live mode this step uses the bash + text-editor tools to build real files.\n\n"
+                   f"Confidence: 0.8")
+            return NodeResult(id=node.id, kind="agent", title=node.title, output=out,
+                              sources=[], confidence=0.8)
         out = (
             f"- **{node.title}** (mock): {_short(node.instruction, 90)}\n"
             f"- Representative point A (illustrative).\n"
