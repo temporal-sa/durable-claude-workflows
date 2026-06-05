@@ -275,15 +275,27 @@ async def stream_turn(console: Console, handle, mock: bool) -> str | None:
 
     # Phase B: live DAG execution.
     final_report: str | None = None
+    last_cur = None
     with Live(console=console, refresh_per_second=8, transient=False) as live:
         while True:
             snap = await _query(handle)
             cur = snap.current
             if cur is not None:
+                last_cur = cur
                 live.update(render_dag_panel(cur, mock))
             if snap.turns_completed > base:
                 if snap.transcript and snap.transcript[-1].role == "assistant":
                     final_report = snap.transcript[-1].content
+                # The turn is finished, but the workflow clears its "current" state in
+                # the same task that marks the last node done, so a query never catches
+                # that moment. Render one final frame as done so the synth step doesn't
+                # linger on screen as "running".
+                if last_cur is not None:
+                    last_cur.phase = "done"
+                    for n in last_cur.nodes:
+                        if n.status == "running":
+                            n.status = "done"
+                    live.update(render_dag_panel(last_cur, mock))
                 break
             await asyncio.sleep(0.35)
     if final_report:

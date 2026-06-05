@@ -291,7 +291,11 @@ REVIEW_SYSTEM = (
 SYNTH_SYSTEM = (
     "You are the SYNTHESIZER. Produce the final deliverable for the user's goal, following your "
     "instruction, integrating the upstream results and explicitly addressing the reviewer's critique. "
-    "Lead with a direct answer, use clear markdown structure, and do not invent facts beyond the inputs."
+    "Lead with a direct answer, use clear markdown structure, and do not invent facts beyond the inputs. "
+    "You receive only the upstream steps' text summaries, NOT the files they wrote to disk. So when the "
+    "workflow produced files, treat those files (for example a generated README) as the source of truth: "
+    "summarize what was built and point the reader to them for exact commands or contents, rather than "
+    "restating or guessing run steps you cannot verify."
 )
 
 
