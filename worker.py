@@ -16,7 +16,7 @@ from temporalio.worker.workflow_sandbox import SandboxedWorkflowRunner, SandboxR
 
 import config
 from activities import plan_workflow, run_node
-from workflows import DurableClaudeAgentWorkflow, NodeWorkflow
+from workflows import AgentWorkflow, DurableClaudeAgentWorkflow
 
 
 def _banner() -> None:
@@ -47,7 +47,7 @@ async def main() -> None:
         worker = Worker(
             client,
             task_queue=config.TASK_QUEUE,
-            workflows=[DurableClaudeAgentWorkflow, NodeWorkflow],
+            workflows=[DurableClaudeAgentWorkflow, AgentWorkflow],
             activities=[plan_workflow, run_node],
             workflow_runner=runner,
             max_concurrent_activities=64,

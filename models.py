@@ -15,7 +15,7 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
-NodeKind = Literal["agent", "review", "synthesize"]
+NodeKind = Literal["agent", "review", "synthesize", "apply"]
 Phase = Literal["planning", "awaiting_approval", "running", "done", "error", "cancelled"]
 NodeStatus = Literal["pending", "running", "done", "failed"]
 
@@ -36,6 +36,9 @@ class WorkflowPlan(BaseModel):
     summary: str = ""                             # 1-2 sentences, shown at the approval prompt
     nodes: list[PlanNode] = Field(default_factory=list)
     output: str = ""                              # id of the node whose result is the final answer
+    input_tokens: int = 0                         # full-price input tokens Claude used to author this plan
+    cached_tokens: int = 0                        # cache-read input tokens (~10% price)
+    output_tokens: int = 0
 
 
 class NodeResult(BaseModel):
@@ -46,6 +49,9 @@ class NodeResult(BaseModel):
     sources: list[str] = Field(default_factory=list)
     confidence: Optional[float] = None
     error: Optional[str] = None
+    input_tokens: int = 0
+    cached_tokens: int = 0
+    output_tokens: int = 0
 
 
 class Turn(BaseModel):
@@ -65,6 +71,9 @@ class NodeProgress(BaseModel):
     workflow_id: Optional[str] = None             # the node's child workflow (visible in the Temporal UI)
     confidence: Optional[float] = None
     note: Optional[str] = None
+    input_tokens: int = 0
+    cached_tokens: int = 0
+    output_tokens: int = 0
 
 
 class TurnProgress(BaseModel):
@@ -73,6 +82,9 @@ class TurnProgress(BaseModel):
     phase: Phase = "planning"
     plan_title: Optional[str] = None
     plan_summary: Optional[str] = None
+    plan_input_tokens: int = 0
+    plan_cached_tokens: int = 0
+    plan_output_tokens: int = 0
     nodes: list[NodeProgress] = Field(default_factory=list)
     report: Optional[str] = None
     error: Optional[str] = None
@@ -87,6 +99,7 @@ class AgentSnapshot(BaseModel):
     turns_completed: int = 0
     transcript: list[Turn] = Field(default_factory=list)
     current: Optional[TurnProgress] = None
+    last_turn: Optional[TurnProgress] = None      # the most recently finished turn (final tokens/status)
     mock: bool = False
     models: dict[str, str] = Field(default_factory=dict)
 
@@ -125,7 +138,7 @@ _NODE_SCHEMA = {
     "additionalProperties": False,
     "properties": {
         "id": {"type": "string", "description": "Stable unique id, e.g. a1, review, final"},
-        "kind": {"type": "string", "enum": ["agent", "review", "synthesize"]},
+        "kind": {"type": "string", "enum": ["agent", "review", "synthesize", "apply"]},
         "title": {"type": "string", "description": "Short label, 2-6 words"},
         "instruction": {"type": "string", "description": "What this step should do"},
         "depends_on": {

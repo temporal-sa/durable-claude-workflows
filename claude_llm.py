@@ -118,7 +118,8 @@ async def heartbeater(interval: float, label: str):
             await task
 
 
-async def _structured(system: str, user: str, schema: dict, *, model: str, effort: str, interval: float) -> dict:
+async def _structured(system: str, user: str, schema: dict, *, model: str, effort: str,
+                      interval: float) -> tuple[dict, tuple[int, int]]:
     client = _client()
     try:
         async with heartbeater(interval, "plan"):
@@ -132,7 +133,7 @@ async def _structured(system: str, user: str, schema: dict, *, model: str, effor
             )
     except Exception as e:  # noqa: BLE001
         raise _map_error(e)
-    return _loads(_first_text(resp))
+    return _loads(_first_text(resp)), _usage_of(resp)
 
 
 async def _stream_text(
@@ -199,6 +200,45 @@ def _dedupe(items: list[str]) -> list[str]:
     return out
 
 
+def _usage_of(msg) -> tuple[int, int, int]:
+    """(fresh_input, cached_input, output) token counts from a response/message.
+
+    fresh = uncached input + cache writes (billed ~full price); cached = cache reads
+    (billed ~10%). Splitting them keeps the displayed totals cost-honest.
+    """
+    u = getattr(msg, "usage", None)
+    if not u:
+        return 0, 0, 0
+    fresh = (getattr(u, "input_tokens", 0) or 0) + (getattr(u, "cache_creation_input_tokens", 0) or 0)
+    cached = getattr(u, "cache_read_input_tokens", 0) or 0
+    return fresh, cached, (getattr(u, "output_tokens", 0) or 0)
+
+
+def _mark_rolling_cache(messages: list[dict]) -> None:
+    """Put a single rolling cache breakpoint on the latest user message so the growing
+    tool-use conversation is read from cache (~10% price) instead of re-billed in full
+    on every turn. (System prompt + tools keep their own breakpoint from ``_system``.)
+    """
+    target = None
+    for m in messages:
+        c = m.get("content")
+        if isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict):
+                    b.pop("cache_control", None)  # clear the previous turn's breakpoint
+            if c and all(isinstance(b, dict) for b in c):  # tool_result / text blocks (skip assistant objects)
+                target = m
+        elif isinstance(c, str):
+            target = m
+    if target is None:
+        return
+    c = target["content"]
+    if isinstance(c, str):
+        target["content"] = [{"type": "text", "text": c, "cache_control": {"type": "ephemeral"}}]
+    elif isinstance(c, list) and c and isinstance(c[-1], dict):
+        c[-1]["cache_control"] = {"type": "ephemeral"}
+
+
 def _extract_confidence(text: str) -> float:
     m = _CONF_RE.search(text or "")
     if m:
@@ -252,25 +292,26 @@ PLAN_SYSTEM = (
     "will execute, fanning independent steps out in parallel.\n\n"
     "Node kinds:\n"
     "- \"agent\": a worker that performs one focused piece of the task by reasoning (and optional "
-    "web search). ONLY agent steps can read/write files and run shell commands (via use_filesystem). "
-    "Use several independent agents (empty depends_on) for parts that can run in parallel.\n"
-    "- \"review\": adversarially cross-checks / validates the outputs of the steps it depends on "
-    "(finds gaps, errors, contradictions). Reads upstream text only; it cannot touch the filesystem.\n"
-    "- \"synthesize\": writes the final SUMMARY/answer text from the steps it depends on. It also cannot "
-    "touch the filesystem, so never put file-writing, build, or fix-applying steps here.\n\n"
+    "web search). ONLY agent and apply steps can read/write files and run shell commands. Use several "
+    "independent agents (empty depends_on) for parts that can run in parallel.\n"
+    "- \"review\": adversarially cross-checks / validates the outputs of the steps it depends on, finding "
+    "errors and listing concrete fixes. Reads upstream text only; it cannot touch the filesystem.\n"
+    "- \"apply\": applies the fixes a review proposed, editing the files in the shared working directory. "
+    "Add one apply step (depending on the review) whenever the workflow produced files, e.g. code.\n"
+    "- \"synthesize\": writes the final SUMMARY/answer text from the steps it depends on. It cannot touch "
+    "the filesystem, so never put file-writing, build, or fix-applying steps here.\n\n"
     "Rules:\n"
-    "- Use {max_nodes} nodes or fewer. Give each a short unique id (e.g. a1, a2, review, final), a "
+    "- Use {max_nodes} nodes or fewer. Give each a short unique id (e.g. a1, a2, review, apply, final), a "
     "short title, and a clear instruction.\n"
     "- depends_on lists the ids whose outputs this node needs; nodes with empty depends_on run first, in parallel.\n"
     "- Include at least one \"review\" step that depends on the agent steps, and exactly one final "
-    "\"synthesize\" step (set it as `output`) that depends on the review.\n"
+    "\"synthesize\" step (set it as `output`).\n"
     "- Set use_web_search=true on steps that need current or external information; false otherwise.\n"
-    "- For tasks that PRODUCE files (writing code/software, generating a project): EVERY step that creates, "
-    "edits, or runs files MUST be an \"agent\" with use_filesystem=true. Those steps share ONE working "
-    "directory, so later steps can read what earlier steps wrote; when file-writing steps run in parallel, "
-    "give each its own subdirectory so they do not clobber shared files. The final assembly/build/test step "
-    "that writes files must also be an \"agent\" with use_filesystem=true (NOT synthesize). Use the single "
-    "synthesize step only for a short text summary of what was built and how to run it.\n"
+    "- For tasks that PRODUCE files (writing code/software, generating a project): every step that creates "
+    "or edits files MUST be an \"agent\" with use_filesystem=true (those steps share ONE working directory, "
+    "so later steps see what earlier ones wrote). Then add a \"review\" of that work, an \"apply\" step that "
+    "depends on the review and applies its fixes to the files, and a final \"synthesize\" that depends on "
+    "apply and writes a short summary of what was built and how to run it.\n"
     "- It MUST be a DAG (no cycles). Tailor the steps to the actual task - this is not limited to research.\n"
     "Respond ONLY with the JSON object matching the provided schema."
 )
@@ -298,6 +339,11 @@ SYNTH_SYSTEM = (
     "restating or guessing run steps you cannot verify."
 )
 
+APPLY_SYSTEM_TEXT = (
+    "You list the concrete fixes that should be applied to address the reviewer's findings, as a short "
+    "actionable checklist. (File tools are disabled, so you cannot edit files directly.)"
+)
+
 
 # --------------------------------------------------------------------------
 # Plan: Claude authors the DAG (then we validate + normalize it)
@@ -314,7 +360,7 @@ def _normalize_plan(data: dict, goal: str, max_nodes: int) -> WorkflowPlan:
             nid = f"{nid}_"
         seen.add(nid)
         kind = n.get("kind")
-        if kind not in ("agent", "review", "synthesize"):
+        if kind not in ("agent", "review", "synthesize", "apply"):
             kind = "agent"
         nodes.append(PlanNode(
             id=nid,
@@ -323,7 +369,7 @@ def _normalize_plan(data: dict, goal: str, max_nodes: int) -> WorkflowPlan:
             instruction=str(n.get("instruction") or goal),
             depends_on=[str(d) for d in (n.get("depends_on") or [])],
             use_web_search=bool(n.get("use_web_search", False)),
-            use_filesystem=bool(n.get("use_filesystem", False)) and kind == "agent",
+            use_filesystem=kind == "apply" or (bool(n.get("use_filesystem", False)) and kind == "agent"),
         ))
 
     if not nodes:  # never hand Temporal an empty graph
@@ -371,7 +417,7 @@ def _break_cycles(nodes: list[PlanNode]) -> None:
 
 
 async def plan(goal: str, history: list[Turn], max_nodes: int, *, model: str, effort: str) -> WorkflowPlan:
-    data = await _structured(
+    data, usage = await _structured(
         PLAN_SYSTEM.format(max_nodes=max_nodes),
         _history_block(history) + f"Task:\n{goal}\n\nDesign the workflow DAG.",
         PLAN_SCHEMA,
@@ -379,17 +425,21 @@ async def plan(goal: str, history: list[Turn], max_nodes: int, *, model: str, ef
         effort=effort,
         interval=config.PLAN_HEARTBEAT_INTERVAL,
     )
-    return _normalize_plan(data, goal, max_nodes)
+    p = _normalize_plan(data, goal, max_nodes)
+    p.input_tokens, p.cached_tokens, p.output_tokens = usage
+    return p
 
 
 # --------------------------------------------------------------------------
 # Run one node
 # --------------------------------------------------------------------------
-_NODE_SYSTEM = {"agent": AGENT_SYSTEM, "review": REVIEW_SYSTEM, "synthesize": SYNTH_SYSTEM}
+_NODE_SYSTEM = {"agent": AGENT_SYSTEM, "review": REVIEW_SYSTEM, "synthesize": SYNTH_SYSTEM,
+                "apply": APPLY_SYSTEM_TEXT}
 _NODE_INTERVAL = {
     "agent": config.AGENT_HEARTBEAT_INTERVAL,
     "review": config.REVIEW_HEARTBEAT_INTERVAL,
     "synthesize": config.SYNTH_HEARTBEAT_INTERVAL,
+    "apply": config.AGENT_HEARTBEAT_INTERVAL,
 }
 
 _WEB_SEARCH_TOOL = {"type": "web_search_20260209", "name": "web_search", "max_uses": 5}
@@ -406,6 +456,15 @@ AGENT_SYSTEM_CODING = (
     "directory (relative paths are fine); if your instruction names an absolute path, treat THIS working "
     "directory as that location. When you finish, syntax-check or run what you wrote if practical, then end "
     "with a short summary listing the files you created or changed."
+)
+
+APPLY_SYSTEM = (
+    "You APPLY the reviewer's fixes to the existing files. You have a text editor and bash, and your "
+    "working directory - the only place you may touch - is:\n  {workspace}\n"
+    "Read the reviewer's findings (provided above) and the relevant files, then make the MINIMAL edits "
+    "needed to fix the correctness issues they raised. Do not rewrite working code or add features. If the "
+    "review found nothing that needs changing, make no edits. After editing, syntax-check or run a quick "
+    "test if practical, then end with a short summary of what you changed (or that nothing was needed)."
 )
 
 
@@ -483,18 +542,25 @@ def _text_editor(inp: dict, workspace: str) -> tuple[str, bool]:
 
 
 async def _agentic(system: str, user: str, *, model: str, effort: str, interval: float, hb: str,
-                   tools: list[dict], workspace: str, max_iters: int = 30) -> str:
+                   tools: list[dict], workspace: str, max_iters: int = 30) -> tuple[str, tuple[int, int, int]]:
     """Run Claude with client-side bash / text-editor tools, executing each tool call on
-    the worker's filesystem and feeding results back, until Claude is done."""
+    the worker's filesystem and feeding results back, until Claude is done. Returns
+    (text, (input_tokens, output_tokens)) summed across every model call in the loop."""
     client = _client()
     messages: list[dict] = [{"role": "user", "content": user}]
     text_parts: list[str] = []
+    tin = tcache = tout = 0
     try:
         async with heartbeater(interval, hb):
             for _ in range(max_iters):
+                _mark_rolling_cache(messages)
                 resp = await client.messages.create(
                     model=model, max_tokens=16000, system=_system(system), messages=messages,
                     tools=tools, thinking={"type": "adaptive"}, output_config={"effort": effort})
+                f, c, o = _usage_of(resp)
+                tin += f
+                tcache += c
+                tout += o
                 for b in resp.content:
                     if getattr(b, "type", None) == "text":
                         text_parts.append(b.text)
@@ -519,7 +585,7 @@ async def _agentic(system: str, user: str, *, model: str, effort: str, interval:
                 break
     except Exception as e:  # noqa: BLE001
         raise _map_error(e)
-    return "".join(text_parts).strip()
+    return "".join(text_parts).strip(), (tin, tcache, tout)
 
 
 async def run_node(goal: str, node: PlanNode, upstream: list[NodeResult], *, model: str, effort: str,
@@ -531,17 +597,20 @@ async def run_node(goal: str, node: PlanNode, upstream: list[NodeResult], *, mod
     )
     interval = _NODE_INTERVAL[node.kind]
     want_search = node.use_web_search and web_search_enabled and node.kind in ("agent", "review")
-    want_fs = node.use_filesystem and config.ENABLE_FILE_TOOLS and node.kind == "agent"
+    want_fs = config.ENABLE_FILE_TOOLS and (node.kind == "apply" or (node.use_filesystem and node.kind == "agent"))
 
-    # Coding path: bash + text editor (+ optional web search), executed on the worker's disk.
+    # Filesystem path: bash + text editor (+ optional web search), executed on the worker's disk.
+    # Used by coding agents and by the apply step (which edits files to apply the review's fixes).
     if want_fs:
         ws = config.workspace_dir()
+        system = APPLY_SYSTEM if node.kind == "apply" else AGENT_SYSTEM_CODING
         tools = [_BASH_TOOL, _EDITOR_TOOL] + ([_WEB_SEARCH_TOOL] if want_search else [])
-        text = await _agentic(AGENT_SYSTEM_CODING.format(workspace=ws), user, model=model, effort=effort,
-                              interval=interval, hb=f"{node.kind}:{node.id}", tools=tools, workspace=ws)
+        text, usage = await _agentic(system.format(workspace=ws), user, model=model, effort=effort,
+                                     interval=interval, hb=f"{node.kind}:{node.id}", tools=tools, workspace=ws)
         return NodeResult(id=node.id, kind=node.kind, title=node.title,
                           output=text or "(no output produced)",
-                          sources=_dedupe(_URL_RE.findall(text))[:10], confidence=_extract_confidence(text))
+                          sources=_dedupe(_URL_RE.findall(text))[:10], confidence=_extract_confidence(text),
+                          input_tokens=usage[0], cached_tokens=usage[1], output_tokens=usage[2])
 
     # Text / web-search path (no filesystem).
     tools = [_WEB_SEARCH_TOOL] if want_search else None
@@ -559,5 +628,7 @@ async def run_node(goal: str, node: PlanNode, upstream: list[NodeResult], *, mod
             raise
     sources = _dedupe(_extract_search_sources(final) + _URL_RE.findall(text))[:10] if tools else []
     confidence = _extract_confidence(text) if node.kind == "agent" else None
+    fin, cin, tout = _usage_of(final)
     return NodeResult(id=node.id, kind=node.kind, title=node.title,
-                      output=text or "(no output produced)", sources=sources, confidence=confidence)
+                      output=text or "(no output produced)", sources=sources, confidence=confidence,
+                      input_tokens=fin, cached_tokens=cin, output_tokens=tout)

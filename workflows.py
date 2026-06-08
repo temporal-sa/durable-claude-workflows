@@ -53,6 +53,7 @@ _NODE_TIMEOUTS = {
     "agent": (timedelta(minutes=60), timedelta(seconds=15)),
     "review": (timedelta(minutes=15), timedelta(seconds=60)),
     "synthesize": (timedelta(minutes=15), timedelta(seconds=60)),
+    "apply": (timedelta(minutes=60), timedelta(seconds=15)),
 }
 
 
@@ -69,8 +70,8 @@ def _safe(node_id: str) -> str:
 
 
 @workflow.defn
-class NodeWorkflow:
-    """One node of the DAG, as its own durable execution.
+class AgentWorkflow:
+    """One node of the DAG (agent / review / apply / synthesize), as its own durable execution.
 
     Modeling every node as a child workflow means each shows up independently in
     the Temporal UI, retries on its own, and is schedulable on any worker.
@@ -78,9 +79,13 @@ class NodeWorkflow:
 
     @workflow.run
     async def run(self, inp: NodeRunInput) -> NodeResult:
-        stc, hb = _NODE_TIMEOUTS.get(inp.node.kind, (timedelta(minutes=15), timedelta(seconds=60)))
+        n = inp.node
+        # Surface what this node is on its own workflow page in the Temporal UI.
+        workflow.set_current_details(f"**{n.kind}** - {n.title}\n\n{n.instruction}")
+        stc, hb = _NODE_TIMEOUTS.get(n.kind, (timedelta(minutes=15), timedelta(seconds=60)))
         return await workflow.execute_activity(
-            run_node, inp, start_to_close_timeout=stc, heartbeat_timeout=hb, retry_policy=_RETRY
+            run_node, inp, start_to_close_timeout=stc, heartbeat_timeout=hb, retry_policy=_RETRY,
+            summary=f"{n.kind}: {n.title}",
         )
 
 
@@ -99,6 +104,7 @@ class DurableClaudeAgentWorkflow:
         self._ended = False
         self._approval: bool | None = None
         self._current: TurnProgress | None = None
+        self._last_turn: TurnProgress | None = None
         if req.initial_prompt:
             self._pending.append(req.initial_prompt)
 
@@ -126,6 +132,7 @@ class DurableClaudeAgentWorkflow:
             turns_completed=self._turns_completed,
             transcript=list(self._transcript),
             current=self._current,
+            last_turn=self._last_turn,
             mock=self._req.mock,
             models=self._req.models,
         )
@@ -154,6 +161,7 @@ class DurableClaudeAgentWorkflow:
             finally:
                 self._turns_completed += 1
                 self._busy = False
+                self._last_turn = self._current   # preserve final tokens/status for the client
                 self._current = None
 
             if (not self._pending and not self._ended
@@ -174,6 +182,8 @@ class DurableClaudeAgentWorkflow:
         history = self._transcript[:-1]
         cur = TurnProgress(index=self._turns_completed, user_prompt=prompt, phase="planning")
         self._current = cur
+        turn = cur.index + 1
+        workflow.set_current_details(f"turn {turn}: planning - {prompt[:80]}")
 
         # 1) PLAN - Claude authors the DAG (recorded in history).
         plan: WorkflowPlan = await workflow.execute_activity(
@@ -182,9 +192,13 @@ class DurableClaudeAgentWorkflow:
             start_to_close_timeout=_PLAN_STC,
             heartbeat_timeout=_PLAN_HB,
             retry_policy=_RETRY,
+            summary="plan: design the workflow DAG",
         )
         cur.plan_title = plan.title
         cur.plan_summary = plan.summary
+        cur.plan_input_tokens = plan.input_tokens
+        cur.plan_cached_tokens = plan.cached_tokens
+        cur.plan_output_tokens = plan.output_tokens
         cur.nodes = [
             NodeProgress(id=n.id, kind=n.kind, title=n.title, instruction=n.instruction,
                          depends_on=n.depends_on, use_filesystem=n.use_filesystem)
@@ -194,6 +208,7 @@ class DurableClaudeAgentWorkflow:
         # 2) APPROVE - surface the plan and wait for y/n (one-shot auto-approves).
         if not self._req.auto_approve:
             cur.phase = "awaiting_approval"
+            workflow.set_current_details(f"turn {turn}: awaiting plan approval - {plan.title}")
             await workflow.wait_condition(lambda: self._approval is not None or self._ended)
             if self._approval is None:  # session ended before approving
                 cur.phase = "cancelled"
@@ -204,10 +219,12 @@ class DurableClaudeAgentWorkflow:
 
         # 3) EXECUTE - durable DAG interpreter.
         cur.phase = "running"
+        workflow.set_current_details(f"turn {turn}: executing {len(plan.nodes)}-node workflow - {plan.title}")
         results = await self._run_dag(prompt, plan)
         out = results.get(plan.output) or (results.get(plan.nodes[-1].id) if plan.nodes else None)
         report = out.output if out else "(workflow produced no output)"
         cur.phase = "done"
+        workflow.set_current_details(f"turn {turn}: done - {plan.title}")
         cur.report = report
         return report
 
@@ -231,10 +248,12 @@ class DurableClaudeAgentWorkflow:
                 child_id = f"{workflow.info().workflow_id}-t{cur.index}-{_safe(node.id)}"
                 try:
                     handle = await workflow.start_child_workflow(
-                        NodeWorkflow.run,
+                        AgentWorkflow.run,
                         NodeRunInput(goal=goal, node=node, upstream=upstream),
                         id=child_id,
                         parent_close_policy=workflow.ParentClosePolicy.TERMINATE,
+                        static_summary=f"{node.kind}: {node.title}",
+                        static_details=node.instruction,
                     )
                     self._set_node(node.id, status="running", workflow_id=handle.id)
                     res: NodeResult = await handle
@@ -243,6 +262,9 @@ class DurableClaudeAgentWorkflow:
                         status="failed" if res.error else "done",
                         confidence=res.confidence,
                         note=res.error or _first_line(res.output),
+                        input_tokens=res.input_tokens,
+                        cached_tokens=res.cached_tokens,
+                        output_tokens=res.output_tokens,
                     )
                     return node.id, res
                 except Exception as e:  # noqa: BLE001 - one node failing must not kill the turn

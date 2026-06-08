@@ -20,12 +20,15 @@ import claude_llm
 import config
 from models import NodeResult, NodeRunInput, PlanInput, PlanNode, WorkflowPlan
 
-_AGENT_MODEL = {"agent": config.AGENT_MODEL, "review": config.REVIEW_MODEL, "synthesize": config.SYNTH_MODEL}
-_AGENT_EFFORT = {"agent": config.AGENT_EFFORT, "review": config.REVIEW_EFFORT, "synthesize": config.SYNTH_EFFORT}
+_AGENT_MODEL = {"agent": config.AGENT_MODEL, "review": config.REVIEW_MODEL,
+                "synthesize": config.SYNTH_MODEL, "apply": config.AGENT_MODEL}
+_AGENT_EFFORT = {"agent": config.AGENT_EFFORT, "review": config.REVIEW_EFFORT,
+                 "synthesize": config.SYNTH_EFFORT, "apply": config.AGENT_EFFORT}
 _MOCK_INTERVAL = {
     "agent": config.AGENT_HEARTBEAT_INTERVAL,
     "review": config.REVIEW_HEARTBEAT_INTERVAL,
     "synthesize": config.SYNTH_HEARTBEAT_INTERVAL,
+    "apply": config.AGENT_HEARTBEAT_INTERVAL,
 }
 
 
@@ -84,6 +87,8 @@ def _mock_plan(inp: PlanInput) -> WorkflowPlan:
                  "findings, then synthesize a verified answer."),
         nodes=nodes,
         output="final",
+        input_tokens=180 + len(inp.goal) // 4,
+        output_tokens=90 + 14 * len(nodes),
     )
 
 
@@ -91,6 +96,12 @@ async def _mock_node(inp: NodeRunInput) -> NodeResult:
     node = inp.node
     async with claude_llm.heartbeater(_MOCK_INTERVAL[node.kind], f"{node.kind}:{node.id}"):
         await asyncio.sleep(config.MOCK_LATENCY)
+    # Rough token estimates so the CLI's usage display works in mock mode too.
+    est_in = 40 + len(node.instruction) // 4 + sum(len(u.output or "") for u in inp.upstream) // 4
+
+    def _r(output: str, **kw) -> NodeResult:
+        return NodeResult(id=node.id, kind=node.kind, title=node.title, output=output,
+                          input_tokens=est_in, output_tokens=max(1, len(output) // 4), **kw)
 
     if node.kind == "agent":
         if node.use_filesystem and config.ENABLE_FILE_TOOLS:
@@ -101,8 +112,7 @@ async def _mock_node(inp: NodeRunInput) -> NodeResult:
             out = (f"- **{node.title}** (mock, coding): wrote `{fname}` to the workspace.\n"
                    f"- In live mode this step uses the bash + text-editor tools to build real files.\n\n"
                    f"Confidence: 0.8")
-            return NodeResult(id=node.id, kind="agent", title=node.title, output=out,
-                              sources=[], confidence=0.8)
+            return _r(out, sources=[], confidence=0.8)
         out = (
             f"- **{node.title}** (mock): {_short(node.instruction, 90)}\n"
             f"- Representative point A (illustrative).\n"
@@ -110,13 +120,18 @@ async def _mock_node(inp: NodeRunInput) -> NodeResult:
             f"- Caveat: generated in MOCK mode - no web search performed.\n\n"
             f"Sources:\n- https://example.com/{node.id}\n\nConfidence: 0.8"
         )
-        return NodeResult(id=node.id, kind="agent", title=node.title, output=out,
-                          sources=[f"https://example.com/{node.id}"], confidence=0.8)
+        return _r(out, sources=[f"https://example.com/{node.id}"], confidence=0.8)
 
     if node.kind == "review":
-        return NodeResult(id=node.id, kind="review", title=node.title,
-                          output="Adversarial review (mock): findings are coherent, sourced, and cover the "
-                                 "main facets; no blocking contradictions. Safe to synthesize.")
+        return _r("Adversarial review (mock): findings are coherent, sourced, and cover the "
+                  "main facets; no blocking contradictions. Safe to synthesize.")
+
+    if node.kind == "apply":
+        if config.ENABLE_FILE_TOOLS:
+            ws = config.workspace_dir()
+            with open(os.path.join(ws, "APPLIED.md"), "a", encoding="utf-8") as f:
+                f.write(f"- applied review fixes for: {_short(node.instruction, 120)}\n")
+        return _r("Applied the reviewer's fixes (mock): made the suggested corrections to the workspace files.")
 
     # synthesize
     lines = [f"# {_short(inp.goal, 80)}", "",
@@ -125,4 +140,4 @@ async def _mock_node(inp: NodeRunInput) -> NodeResult:
         if r.kind == "agent":
             lines.append(f"## {r.title}\n{r.output}\n")
     lines.append("---\n*MOCK mode - Claude plans the DAG, Temporal executes it. Set ANTHROPIC_API_KEY for real Claude.*")
-    return NodeResult(id=node.id, kind="synthesize", title=node.title, output="\n".join(lines))
+    return _r("\n".join(lines))

@@ -10,6 +10,7 @@ dependencies = [
     "pydantic>=2.7",
     "rich>=13.7",
     "python-dotenv>=1.0",
+    "prompt-toolkit>=3.0",
 ]
 
 # Flat module layout (no package / no __init__.py). Tell uv to manage only the

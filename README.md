@@ -20,10 +20,10 @@ This sample keeps the good part - **Claude plans the work** - and moves the *exe
   and the fan-out spreads across more machines.
 
 > **Claude plans the DAG, Temporal executes it.** For *any* task, Claude returns a plan as a directed
-> graph of typed steps - `agent` (a worker), `review` (adversarial cross-check), `synthesize` (the final
-> answer) - wired by dependencies. You approve the plan (y/N), then a durable Temporal workflow runs it:
-> every node becomes its own child workflow that calls Claude, independent nodes run in parallel, and
-> every result is recorded so a crash resumes mid-run.
+> graph of typed steps - `agent` (a worker), `review` (adversarial cross-check), `apply` (apply the
+> review's fixes to the files), `synthesize` (the final answer) - wired by dependencies. You approve the
+> plan (y/N), then a durable Temporal workflow runs it: every node becomes its own child workflow that
+> calls Claude, independent nodes run in parallel, and every result is recorded so a crash resumes mid-run.
 
 | | Claude Code dynamic workflows | This sample (Temporal) |
 |---|---|---|
@@ -44,8 +44,8 @@ Press enter in the chat client and it starts one durable Temporal workflow - the
 chat. Each task runs three stages:
 
 1. **Plan** - ask Claude to design the workflow as a DAG of typed nodes - `agent` (a worker),
-   `review` (adversarial cross-check), `synthesize` (final answer) - wired by dependencies.
-   *(This is the dynamic workflow Claude authors - as data, not code.)*
+   `review` (adversarial cross-check), `apply` (apply the review's fixes to the files), `synthesize`
+   (final answer) - wired by dependencies. *(This is the dynamic workflow Claude authors - as data, not code.)*
 2. **Approve** - the plan is shown to you and you approve it (y/N), mirroring Claude Code's "approve
    the plan before it runs". One-shot `--once` auto-approves.
 3. **Execute** - a durable DAG interpreter runs the graph: every node becomes its own child workflow
@@ -199,8 +199,8 @@ client banners show `auth=api-key` so you know you're on Cloud.
 config.py      configuration (Temporal address, models, mock toggle), read from .env
 models.py      shared models, incl. the WorkflowPlan DAG + its JSON schema
 claude_llm.py  the only module that calls Claude (Anthropic SDK)
-activities.py  plan_workflow (Claude designs the DAG) + run_node (agent / review / synthesize) + mock
-workflows.py   the durable agent-loop workflow (plan -> approve -> DAG executor) + NodeWorkflow (one child workflow per node)
+activities.py  plan_workflow (Claude designs the DAG) + run_node (agent / review / apply / synthesize) + mock
+workflows.py   the durable agent-loop workflow (plan -> approve -> DAG executor) + AgentWorkflow (one child workflow per node)
 worker.py      runs a Temporal worker
 client.py      the Temporal-branded chat client
 ```

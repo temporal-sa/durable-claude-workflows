@@ -15,10 +15,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import os
 import signal
-import threading
 import uuid
 
+from prompt_toolkit import PromptSession
+from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import InMemoryHistory
 from rich import box
 from rich.console import Console, Group
 from rich.live import Live
@@ -39,6 +42,7 @@ CLAUDE = "#D97757"  # Claude/Anthropic-ish terracotta
 _KIND_TAG = {
     "agent": f"[{ACCENT}]agent[/]",
     "review": "[magenta]review[/]",
+    "apply": "[cyan]apply[/]",
     "synthesize": "[green]synth[/]",
 }
 _STATUS_ICON = {
@@ -57,6 +61,15 @@ _PHASE_RANK = {"planning": 0, "awaiting_approval": 0, "running": 1, "done": 2, "
 def _trunc(s: str, n: int) -> str:
     s = " ".join((s or "").split())
     return s if len(s) <= n else s[: n - 1] + "..."
+
+
+def _fmt_tok(n: int) -> str:
+    n = int(n or 0)
+    if n < 1000:
+        return str(n)
+    if n < 1_000_000:
+        return f"{n / 1000:.1f}k"
+    return f"{n / 1_000_000:.2f}M"
 
 
 def _waves(nodes) -> list[list]:
@@ -114,6 +127,7 @@ def render_dag_panel(cur: TurnProgress, mock: bool) -> Panel:
     t.add_column("", width=2, no_wrap=True)
     t.add_column("step", ratio=3)
     t.add_column("status", ratio=5, overflow="fold")
+    t.add_column("in/out", justify="right", no_wrap=True, style="dim")
     t.add_column("execution", ratio=2, style="dim", overflow="fold")
     for n in cur.nodes:
         if n.status == "running":
@@ -126,8 +140,18 @@ def render_dag_panel(cur: TurnProgress, mock: bool) -> Panel:
         else:
             info = "[dim]queued[/]"
         wf = n.workflow_id.rsplit("-", 1)[-1] if n.workflow_id else ""
-        t.add_row(_STATUS_ICON.get(n.status, "o"), f"{_KIND_TAG.get(n.kind, n.kind)} {escape(n.title)}", info, wf)
+        tok = f"{_fmt_tok(n.input_tokens)}/{_fmt_tok(n.output_tokens)}" if (n.input_tokens or n.output_tokens) else ""
+        t.add_row(_STATUS_ICON.get(n.status, "o"), f"{_KIND_TAG.get(n.kind, n.kind)} {escape(n.title)}", info, tok, wf)
     body.append(t)
+
+    fresh = cur.plan_input_tokens + sum(x.input_tokens for x in cur.nodes)
+    cached = cur.plan_cached_tokens + sum(x.cached_tokens for x in cur.nodes)
+    out = cur.plan_output_tokens + sum(x.output_tokens for x in cur.nodes)
+    if fresh or cached or out:
+        cached_part = f" · [b]{_fmt_tok(cached)}[/] cached" if cached else ""
+        body.append(Text.from_markup(
+            f"[dim]tokens[/]  [b]{_fmt_tok(fresh + cached + out)}[/]  "
+            f"[dim]([b]{_fmt_tok(fresh)}[/] in{cached_part} · [b]{_fmt_tok(out)}[/] out)[/]"))
     title = f"[bold {ACCENT}]dynamic workflow[/] [dim]- turn {cur.index + 1}[/]"
     return Panel(Group(*body), title=title, title_align="left",
                  subtitle="[yellow]mock[/]" if mock else None, border_style=ACCENT, padding=(1, 2))
@@ -163,6 +187,7 @@ def print_help(console: Console) -> None:
         Panel(
             "[bold]/help[/]   show this help\n"
             "[bold]/new[/]    start a fresh chat session (new workflow)\n"
+            "[bold]/file[/]   submit a task from a file (for prompts longer than the terminal line limit)\n"
             "[bold]/ui[/]     print the Temporal Web UI link for this session\n"
             "[bold]/exit[/]   end the session gracefully (also /quit, :q)\n"
             "[bold]Ctrl-C[/]  terminate the workflow + its nodes, then quit\n\n"
@@ -189,23 +214,28 @@ def _print_session(console: Console, wf_id: str, ui_base: str | None) -> None:
 # --------------------------------------------------------------------------
 # Input + Ctrl-C handling
 # --------------------------------------------------------------------------
-async def _ainput(console: Console, prompt: str) -> str | None:
-    loop = asyncio.get_running_loop()
-    fut: asyncio.Future = loop.create_future()
+_PROMPT_SESSION: PromptSession | None = None
 
-    def _work() -> None:
-        try:
-            line = console.input(prompt)
-        except (EOFError, KeyboardInterrupt):
-            loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(None))
-            return
-        except BaseException as exc:  # noqa: BLE001
-            loop.call_soon_threadsafe(lambda: fut.done() or fut.set_exception(exc))
-            return
-        loop.call_soon_threadsafe(lambda: fut.done() or fut.set_result(line))
 
-    threading.Thread(target=_work, daemon=True).start()
-    return await fut
+def _prompt_session() -> PromptSession:
+    global _PROMPT_SESSION
+    if _PROMPT_SESSION is None:
+        _PROMPT_SESSION = PromptSession(history=InMemoryHistory())
+    return _PROMPT_SESSION
+
+
+async def _ainput(message, interrupted: asyncio.Event | None = None) -> str | None:
+    """Read a line via prompt_toolkit so long pastes (bracketed paste) and line editing
+    work, with none of the terminal's ~1024-char single-line cap. Ctrl-D returns None;
+    Ctrl-C sets the interrupt event (if given) and returns None."""
+    try:
+        return await _prompt_session().prompt_async(message)
+    except EOFError:        # Ctrl-D
+        return None
+    except KeyboardInterrupt:  # Ctrl-C
+        if interrupted is not None:
+            interrupted.set()
+        return None
 
 
 async def _until_interrupt(coro, interrupted: asyncio.Event):
@@ -235,7 +265,7 @@ async def _query(handle):
             await asyncio.sleep(0.3)
 
 
-async def stream_turn(console: Console, handle, mock: bool) -> str | None:
+async def stream_turn(console: Console, handle, mock: bool, interrupted: asyncio.Event) -> str | None:
     base: int | None = None
     plan_rendered = False
     approved: bool | None = None
@@ -255,7 +285,7 @@ async def stream_turn(console: Console, handle, mock: bool) -> str | None:
                 return snap.transcript[-1].content
             return None
         if cur is not None and cur.phase == "awaiting_approval":
-            ans = await _ainput(console, "[bold]Run this workflow?[/] [y/N] ")
+            ans = await _ainput(HTML("<b>Run this workflow?</b> [y/N] "), interrupted)
             approved = (ans or "").strip().lower() in ("y", "yes")
             await handle.signal(DurableClaudeAgentWorkflow.approve_plan, approved)
             break
@@ -286,16 +316,17 @@ async def stream_turn(console: Console, handle, mock: bool) -> str | None:
             if snap.turns_completed > base:
                 if snap.transcript and snap.transcript[-1].role == "assistant":
                     final_report = snap.transcript[-1].content
-                # The turn is finished, but the workflow clears its "current" state in
-                # the same task that marks the last node done, so a query never catches
-                # that moment. Render one final frame as done so the synth step doesn't
-                # linger on screen as "running".
-                if last_cur is not None:
-                    last_cur.phase = "done"
-                    for n in last_cur.nodes:
+                # The workflow clears "current" in the same task that finishes the last
+                # node, so the live view never catches the final done state (with the last
+                # node's tokens). Prefer the workflow's snapshot of the completed turn,
+                # which has the authoritative final tokens/status.
+                final_cur = snap.last_turn or last_cur
+                if final_cur is not None:
+                    final_cur.phase = "done"
+                    for n in final_cur.nodes:
                         if n.status == "running":
                             n.status = "done"
-                    live.update(render_dag_panel(last_cur, mock))
+                    live.update(render_dag_panel(final_cur, mock))
                 break
             await asyncio.sleep(0.35)
     if final_report:
@@ -322,6 +353,9 @@ async def _start_session(client: Client, args, mock: bool, models: dict, prompt:
         ),
         id=session_id,
         task_queue=config.TASK_QUEUE,
+        static_summary=f"Claude dynamic workflow - {session_id}",
+        static_details=("Durable multi-agent chat session. Claude plans a DAG (agent / review / apply / "
+                        "synthesize); Temporal runs each node as its own AgentWorkflow child."),
     )
 
 
@@ -354,7 +388,7 @@ async def amain(args) -> int:
             handle = await _start_session(client, args, mock, models, prompt=args.once)
             _print_session(console, handle.id, ui_base)
             console.print(f"\n[bold {ACCENT}]temporal >[/] {escape(args.once)}")
-            await _until_interrupt(stream_turn(console, handle, mock), interrupted)
+            await _until_interrupt(stream_turn(console, handle, mock, interrupted), interrupted)
             if not interrupted.is_set():
                 with contextlib.suppress(Exception):
                     await handle.signal(DurableClaudeAgentWorkflow.end_session)
@@ -365,7 +399,8 @@ async def amain(args) -> int:
         console.print("[dim]type a task and press enter - /help for commands - Ctrl-C terminates[/]")
 
         while not interrupted.is_set():
-            done, line = await _until_interrupt(_ainput(console, f"\n[bold {ACCENT}]temporal >[/] "), interrupted)
+            done, line = await _until_interrupt(
+                _ainput(HTML(f'\n<b><style fg="{ACCENT}">temporal &gt;</style></b> '), interrupted), interrupted)
             if not done or line is None:  # Ctrl-C, or EOF (Ctrl-D)
                 break
             line = line.strip()
@@ -384,8 +419,24 @@ async def amain(args) -> int:
                 console.print()
                 _print_session(console, handle.id, ui_base)
                 continue
+            if line == "/file" or line.startswith("/file "):
+                # Submit a task from a file - handles prompts longer than the terminal's
+                # single-line input limit (~1024 chars on macOS).
+                path = line[5:].strip().strip("\"'")
+                if not path:
+                    console.print("[dim]usage: /file <path>[/]")
+                    continue
+                try:
+                    line = open(os.path.expanduser(path), encoding="utf-8").read().strip()
+                except OSError as e:  # noqa: BLE001
+                    console.print(f"[red]could not read {path}: {e}[/]")
+                    continue
+                if not line:
+                    console.print("[dim](file is empty)[/]")
+                    continue
+                console.print(f"[dim]loaded {len(line)} chars from {path}[/]")
             await handle.signal(DurableClaudeAgentWorkflow.submit_prompt, line)
-            done, _ = await _until_interrupt(stream_turn(console, handle, mock), interrupted)
+            done, _ = await _until_interrupt(stream_turn(console, handle, mock, interrupted), interrupted)
             if not done:  # Ctrl-C mid-turn
                 break
 
